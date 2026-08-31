@@ -26,6 +26,14 @@ from .exceptions import (
     JobNotFoundError,
     JobSubmissionError,
 )
+from .gateway_poll import (
+    GatewayHTTPError,
+    expired_detail,
+    is_expired_poll_response,
+    parse_submission,
+    resolve_polling_url,
+    submit_url,
+)
 
 
 class JobHandle:
@@ -38,12 +46,12 @@ class JobHandle:
 
     async def poll(self) -> dict[str, Any]:
         """One GET against the polling URL. Returns the raw job record dict."""
-        response = await self._client._http.get(self._client._base_url + self.polling_url)
+        url = resolve_polling_url(self._client._base_url, self.polling_url)
+        response = await self._client._http.get(url)
         if response.status_code == 404:
             raise JobNotFoundError(self.job_id)
-        if response.status_code == 410:
-            detail = response.json().get("detail", "result expired")
-            raise JobExpiredError(detail)
+        if is_expired_poll_response(response.status_code):
+            raise JobExpiredError(expired_detail(response.json()))
         response.raise_for_status()
         return response.json()
 
@@ -91,11 +99,13 @@ class JobGatewayClient:
         body = dict(params)
         if webhook_url:
             body["webhook_url"] = webhook_url
-        response = await self._http.post(f"{self._base_url}/v1/{capability}", json=body)
-        if response.status_code >= 400:
-            raise JobSubmissionError(response.status_code, response.text)
-        data = response.json()
-        return JobHandle(self, data["id"], data["polling_url"])
+        response = await self._http.post(submit_url(self._base_url, capability), json=body)
+        body_json = response.json() if response.status_code < 400 else None
+        try:
+            job_id, polling_url = parse_submission(response.status_code, body_json, response.text)
+        except GatewayHTTPError as exc:
+            raise JobSubmissionError(exc.status_code, exc.body_text) from exc
+        return JobHandle(self, job_id, polling_url)
 
     async def aclose(self) -> None:
         if self._owns_http:
