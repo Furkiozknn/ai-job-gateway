@@ -139,6 +139,44 @@ async def test_webhook_never_raises_and_job_status_unaffected_on_delivery_failur
 
 
 @pytest.mark.asyncio
+async def test_store_failure_during_processing_transition_ends_job_as_error(store):
+    """A store-layer failure (not a provider failure) while recording the
+    ``processing`` transition must not leave the job stuck forever with an
+    unretrieved task exception -- it should still land in ``error``."""
+
+    class FlakyStore:
+        """Wraps a real store; raises once on the first PROCESSING write."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self._armed = True
+
+        async def create(self, record):
+            await self._inner.create(record)
+
+        async def get(self, job_id):
+            return await self._inner.get(job_id)
+
+        async def update_status(self, job_id, **kwargs):
+            if self._armed and kwargs.get("status") == JobStatus.PROCESSING:
+                self._armed = False
+                raise RuntimeError("simulated store outage")
+            return await self._inner.update_status(job_id, **kwargs)
+
+        async def list(self):
+            return await self._inner.list()
+
+    flaky = FlakyStore(store)
+    manager = JobManager(flaky, {"mock-generate": MockProvider(delay_seconds=0.01)})
+
+    record = await manager.submit("mock-generate", {})
+    final = await _wait_until_terminal(store, record.id)
+
+    assert final.status == JobStatus.ERROR
+    assert "internal error" in final.error.lower()
+
+
+@pytest.mark.asyncio
 async def test_no_webhook_url_means_no_delivery_attempt(store):
     called = False
 

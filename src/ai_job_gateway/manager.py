@@ -105,23 +105,49 @@ class JobManager:
         return record
 
     async def _run(self, job_id: str, provider: Provider, params: dict) -> None:
-        await self.store.update_status(job_id, status=JobStatus.PROCESSING)
         try:
-            result = await provider.run(job_id, params)
-        except Exception as exc:  # noqa: BLE001 - deliberately broad: any
-            # provider failure becomes a reported error, never an unhandled
-            # exception that would silently kill the background task.
-            record = await self.store.update_status(
-                job_id, status=JobStatus.ERROR, error=str(exc)
+            await self.store.update_status(job_id, status=JobStatus.PROCESSING)
+            try:
+                result = await provider.run(job_id, params)
+            except Exception as exc:  # noqa: BLE001 - deliberately broad: any
+                # provider failure becomes a reported error, never an unhandled
+                # exception that would silently kill the background task.
+                record = await self.store.update_status(
+                    job_id, status=JobStatus.ERROR, error=str(exc)
+                )
+            else:
+                expires_at = clock.now() + self.result_ttl
+                record = await self.store.update_status(
+                    job_id,
+                    status=JobStatus.READY,
+                    result=result,
+                    result_expires_at=expires_at,
+                )
+        except Exception:  # noqa: BLE001 - deliberately broad: a failure in
+            # the *store* itself (e.g. the update_status(PROCESSING) call
+            # above, or the update_status(ERROR) call in the inner except
+            # branch) is not covered by the inner try/except, which only
+            # guards provider.run(). Without this outer guard, a store-layer
+            # failure would propagate out of this asyncio.create_task with
+            # nothing to retrieve it (asyncio just logs "Task exception was
+            # never retrieved" to stderr), leaving the job stuck at its last
+            # status forever -- no error recorded, no webhook ever attempted,
+            # and nothing observable through the API. Catch it, log it, and
+            # make a best-effort attempt to still record the job as failed.
+            logger.exception(
+                "job %s: unrecoverable failure while running/recording status", job_id
             )
-        else:
-            expires_at = clock.now() + self.result_ttl
-            record = await self.store.update_status(
-                job_id,
-                status=JobStatus.READY,
-                result=result,
-                result_expires_at=expires_at,
-            )
+            try:
+                record = await self.store.update_status(
+                    job_id, status=JobStatus.ERROR, error="internal error while running job"
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "job %s: also failed to record error status after the failure above; "
+                    "giving up (job will remain stuck at its last recorded status)",
+                    job_id,
+                )
+                return
         await self._deliver_webhook(record)
 
     async def _deliver_webhook(self, record: JobRecord) -> None:
