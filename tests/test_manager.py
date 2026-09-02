@@ -177,6 +177,99 @@ async def test_store_failure_during_processing_transition_ends_job_as_error(stor
 
 
 @pytest.mark.asyncio
+async def test_webhook_delivery_includes_hmac_signature_when_secret_configured(store):
+    import hashlib
+    import hmac as hmac_module
+
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = await request.aread()
+        captured["signature"] = request.headers.get("X-Gateway-Signature")
+        return httpx.Response(200)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    manager = JobManager(
+        store,
+        {"mock-generate": MockProvider(delay_seconds=0.01)},
+        http_client=http_client,
+        webhook_signing_secret="s3cret",
+    )
+
+    record = await manager.submit("mock-generate", {}, webhook_url="https://example.test/hook")
+    await _wait_until_terminal(store, record.id)
+    for _ in range(50):
+        if "signature" in captured:
+            break
+        await asyncio.sleep(0.01)
+
+    expected = "sha256=" + hmac_module.new(
+        b"s3cret", captured["body"], hashlib.sha256
+    ).hexdigest()
+    assert captured["signature"] == expected
+
+
+@pytest.mark.asyncio
+async def test_webhook_delivery_has_no_signature_header_without_secret(store):
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["signature"] = request.headers.get("X-Gateway-Signature")
+        return httpx.Response(200)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    manager = JobManager(
+        store, {"mock-generate": MockProvider(delay_seconds=0.01)}, http_client=http_client
+    )
+
+    record = await manager.submit("mock-generate", {}, webhook_url="https://example.test/hook")
+    await _wait_until_terminal(store, record.id)
+    for _ in range(50):
+        if "signature" in captured:
+            break
+        await asyncio.sleep(0.01)
+
+    assert captured["signature"] is None
+
+
+@pytest.mark.asyncio
+async def test_submit_with_same_idempotency_key_returns_original_record_and_runs_once(store):
+    run_count = 0
+
+    class CountingProvider(MockProvider):
+        name = "counting"
+
+        async def run(self, job_id, params):
+            nonlocal run_count
+            run_count += 1
+            return await super().run(job_id, params)
+
+    manager = JobManager(store, {"counting": CountingProvider(delay_seconds=0.01)})
+
+    first = await manager.submit("counting", {"a": 1}, idempotency_key="key-1")
+    second = await manager.submit("counting", {"a": 1}, idempotency_key="key-1")
+    assert first.id == second.id
+
+    await _wait_until_terminal(store, first.id)
+    assert run_count == 1
+    assert len(await store.list()) == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_with_different_idempotency_keys_creates_distinct_jobs(manager):
+    first = await manager.submit("echo", {"a": 1}, idempotency_key="key-a")
+    second = await manager.submit("echo", {"a": 1}, idempotency_key="key-b")
+    assert first.id != second.id
+
+
+@pytest.mark.asyncio
+async def test_submit_without_idempotency_key_never_dedupes(manager):
+    first = await manager.submit("echo", {"a": 1})
+    second = await manager.submit("echo", {"a": 1})
+    assert first.id != second.id
+
+
+@pytest.mark.asyncio
 async def test_no_webhook_url_means_no_delivery_attempt(store):
     called = False
 

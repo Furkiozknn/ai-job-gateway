@@ -1,5 +1,7 @@
 # ai-job-gateway
 
+**Submit a generative-AI job, get an id back instantly, poll or get webhooked when it's done — a small, hardened, provider-agnostic reference server for the async job contract every serious inference API ends up with.**
+
 A provider-agnostic, self-hostable reference implementation of the async job contract independently converged on by [fal.ai](https://fal.ai), [Black Forest Labs' own hosted API](https://bfl.ai), and RunPod's [`worker-comfyui`](https://github.com/runpod-workers/worker-comfyui):
 
 ```
@@ -110,6 +112,26 @@ curl -X POST http://127.0.0.1:8000/v1/mock-generate \
 
 Your endpoint receives a `POST` with the full job record as JSON once the job reaches `ready` or `error`. Delivery retries up to 3 times with backoff on failure; if every attempt fails, it's logged and dropped — the job's own status in the store is already correct regardless of whether the webhook ever arrives, so a caller relying on polling as a fallback is never left with stale state.
 
+`webhook_url` must be an absolute `http://` or `https://` URL — anything else (`file://`, `javascript:`, a bare hostname) is rejected with `422` at submission time, before it's ever stored or dialed. Point it at any local HTTP listener that logs incoming requests to inspect deliveries and exercise the retry behavior against a real server instead of a mock transport.
+
+**Verifying deliveries are genuine.** Construct the `JobManager` with `webhook_signing_secret="..."` and every webhook POST carries an `X-Gateway-Signature: sha256=<hex>` header — the HMAC-SHA256 of the exact request body, keyed by that secret. Your receiver recomputes the same HMAC over the raw body and compares it (constant-time) to the header to confirm the request really came from this gateway and wasn't forged or altered in transit — the same shape Stripe- and GitHub-style webhook signing uses. Signing is opt-in and off by default; nothing about the documented payload shape changes when it's off.
+
+### Idempotent submission
+
+Pass an `Idempotency-Key` header on `POST /v1/{capability}` to make retrying a submission safe. If a request with the same key was already accepted, the *original* job's `{id, polling_url}` is returned and no second job is created or run — useful when your own retry logic (or a flaky network) might resend a submission whose response never arrived:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/mock-generate \
+  -H 'Idempotency-Key: order-4711-attempt-1' \
+  -d '{"prompt": "a cat"}'
+```
+
+This is a single-process, in-memory, best-effort window (bounded to the 10,000 most recent keys) — it does not survive a restart and isn't shared across processes, matching this repo's existing `InMemoryJobStore` honesty about what "reference implementation" means. Omit the header and every submission is independent, exactly as before.
+
+### Operability
+
+`GET /health` returns `{"status": "ok"}` and touches nothing but the running process — a liveness probe for a load balancer or orchestrator, independent of whatever `JobStore` backend is degraded or not.
+
 ## Using the Python client
 
 ```python
@@ -136,6 +158,17 @@ uv run pytest
 
 The suite is fully async (`pytest-asyncio`), exercises the manager/store/server/client layers independently and together (server tests drive the FastAPI app in-process via `httpx.ASGITransport` — no real sockets), and verifies expiry/webhook-retry behavior by monkeypatching `ai_job_gateway.clock.now` and webhook delivery via `httpx.MockTransport`, never by sleeping for real minutes.
 
+## Security notes
+
+This is a reference implementation exposed to whatever calls it, so it's worth being explicit about what's hardened and what deliberately isn't:
+
+- **Request body size is capped** (1 MB by default, `create_app(manager, max_body_bytes=...)` to change it). Without this, `POST /v1/{capability}` would buffer an arbitrarily large body into memory before validating anything — a cheap denial-of-service vector. The body is now read as a capped stream, not via a single unbounded `request.json()`.
+- **`webhook_url` scheme is validated.** Submitting a job asks this server to make an outbound HTTP request to a caller-supplied URL later, on its own schedule — the textbook SSRF shape. Only `http://`/`https://` URLs with a host are accepted; `file://`, `gopher://`, and similar are rejected at submission time with `422`.
+- **What's *not* done, on purpose:** host-level SSRF blocking (loopback, link-local/cloud-metadata addresses like `169.254.169.254`, private IP ranges) is *not* implemented. This reference server's own documented webhook workflow is "point `webhook_url` at a local listener on 127.0.0.1" — blocking loopback here would make the gateway unable to demonstrate its own headline feature. A real deployment sitting behind a real network boundary should enforce host-level SSRF policy at that boundary (an egress proxy/allowlist), where it belongs.
+- **Capability names are constrained** to 1–100 characters of `[A-Za-z0-9_-]`, rejected with `422` otherwise, so a malformed path segment fails fast and legibly rather than becoming an opaque "unknown capability" or an odd log line.
+- **Webhook deliveries can be signed** (HMAC-SHA256, opt-in via `webhook_signing_secret`) so a receiver can verify a delivery genuinely came from this gateway and wasn't forged or tampered with — see [Webhooks](#webhooks) above.
+- **Still absent:** authentication and rate limiting. Anyone who can reach this server can submit jobs and read any job's result by id (job ids are unguessable UUIDs, but there's no ownership check). A public deployment needs API keys and per-key quotas before this is safe to expose — see the roadmap below.
+
 ## Roadmap — what a production deployment would add
 
 This is a reference implementation; it's honest about what it isn't:
@@ -143,7 +176,8 @@ This is a reference implementation; it's honest about what it isn't:
 - **Real job queue.** The in-process `asyncio.create_task` model is fine for one server process. Real traffic needs a real queue (Redis/RQ, Celery, or dispatching to serverless GPU workers) so job execution survives a server restart and scales past one machine.
 - **Auth & rate limiting.** There is none. A public deployment needs API keys and per-key quotas before this is safe to expose.
 - **Real providers.** `EchoProvider`/`MockProvider` prove the contract; a real deployment implements `Provider` for actual backends (FLUX, Wan2.2, MuseTalk, whatever).
-- **Multi-worker/multi-process coordination.** `InMemoryJobStore` doesn't share state across processes; `SQLiteJobStore` survives a restart but isn't built for concurrent multi-process writers. A real deployment at that scale wants Postgres (or similar) behind the same `JobStore` interface.
+- **Multi-worker/multi-process coordination.** `InMemoryJobStore` doesn't share state across processes; `SQLiteJobStore` survives a restart but isn't built for concurrent multi-process writers. A real deployment at that scale wants Postgres (or similar) behind the same `JobStore` interface. The idempotency-key dedupe window described above has the same limitation.
+- **Host-level SSRF policy for webhooks.** See Security notes above — this belongs at a real deployment's network boundary, not hardcoded into a reference gateway.
 - **Adaptive batching / multi-stage pipelines.** Out of scope here — see this project's sibling research notes on generative-AI infrastructure patterns for where that fits in a larger system.
 
 ## License
