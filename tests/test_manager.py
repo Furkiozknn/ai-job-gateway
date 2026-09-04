@@ -286,3 +286,61 @@ async def test_no_webhook_url_means_no_delivery_attempt(store):
     await asyncio.sleep(0.05)
 
     assert called is False
+
+
+async def test_webhook_deliveries_share_one_client_for_the_managers_lifetime(monkeypatch):
+    """A client per delivery paid connection setup on every webhook and threw
+    the pool away. One client per manager, closed by aclose()."""
+    import httpx
+
+    from ai_job_gateway import manager as manager_module
+    from ai_job_gateway.manager import JobManager
+    from ai_job_gateway.providers import EchoProvider
+    from ai_job_gateway.store import InMemoryJobStore
+
+    constructed = []
+    received = []
+
+    def handler(request):
+        received.append(request.url.path)
+        return httpx.Response(200)
+
+    real_async_client = httpx.AsyncClient
+
+    def counting_client(*args, **kwargs):
+        constructed.append(1)
+        return real_async_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(manager_module.httpx, "AsyncClient", counting_client)
+
+    store = InMemoryJobStore()
+    manager = JobManager(store, {"echo": EchoProvider()})
+    for i in range(3):
+        record = await manager.submit("echo", {"i": i}, webhook_url=f"http://receiver.test/hook/{i}")
+        for _ in range(100):
+            current = await store.get(record.id)
+            if current.status.value in ("ready", "error"):
+                break
+            await asyncio.sleep(0.01)
+    for _ in range(100):
+        if len(received) == 3:
+            break
+        await asyncio.sleep(0.01)
+
+    assert received == ["/hook/0", "/hook/1", "/hook/2"]
+    assert len(constructed) == 1
+    await manager.aclose()
+    assert manager._http_client is None
+
+
+async def test_an_injected_client_is_never_closed_by_the_manager():
+    import httpx
+
+    from ai_job_gateway.manager import JobManager
+    from ai_job_gateway.store import InMemoryJobStore
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    manager = JobManager(InMemoryJobStore(), {}, http_client=client)
+    await manager.aclose()
+    assert not client.is_closed
+    await client.aclose()

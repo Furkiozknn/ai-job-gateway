@@ -15,12 +15,14 @@ webhook), and a `capability` is opaque to the transport: whatever
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import json
 import re
-from typing import Any
+from typing import Optional, Any
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Query, FastAPI, HTTPException, Request
 
 from .exceptions import UnknownCapabilityError
 from .manager import JobManager
@@ -106,7 +108,17 @@ def create_app(manager: JobManager, *, max_body_bytes: int = DEFAULT_MAX_BODY_BY
     embedding this server) can spin up multiple independent apps, each with
     its own store/registry, in the same process.
     """
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            # Close the webhook client the manager created (an injected one
+            # is left to its owner). Runs on server shutdown.
+            await manager.aclose()
+
     app = FastAPI(
+        lifespan=_lifespan,
         title="ai-job-gateway",
         description=(
             "Provider-agnostic reference implementation of the submit/poll/webhook "
@@ -154,6 +166,62 @@ def create_app(manager: JobManager, *, max_body_bytes: int = DEFAULT_MAX_BODY_BY
         if record.status == JobStatus.EXPIRED:
             raise HTTPException(410, record.error or "this job's result has expired")
         return record.model_dump(mode="json")
+
+    @app.get("/v1/jobs")
+    async def list_jobs(
+        status: Optional[str] = None,
+        capability: Optional[str] = None,
+        limit: int = Query(default=50, ge=1, le=500),
+    ) -> dict[str, Any]:
+        """Recent jobs, newest first, optionally filtered by status and/or
+        capability. Expired jobs are listed with status "expired" (their
+        result is gone; the record is not).
+
+        Filtering and the limit are applied in memory on top of
+        ``JobStore.list()``, which is the honest shape for a reference store
+        that documents itself as unpaginated; a real deployment's store would
+        push both into the query.
+        """
+        wanted_status: Optional[JobStatus] = None
+        if status is not None:
+            try:
+                wanted_status = JobStatus(status)
+            except ValueError:
+                raise HTTPException(
+                    422, f"status must be one of {[s.value for s in JobStatus]}, got {status!r}"
+                )
+        if capability is not None and not _CAPABILITY_NAME_RE.match(capability):
+            raise HTTPException(422, "capability filter contains characters no capability can have")
+
+        records = await manager.store.list()
+        if wanted_status is not None:
+            records = [r for r in records if r.status == wanted_status]
+        if capability is not None:
+            records = [r for r in records if r.capability == capability]
+        records.sort(key=lambda r: r.created_at, reverse=True)
+        page = records[:limit]
+        return {
+            "jobs": [r.model_dump(mode="json") for r in page],
+            "count": len(page),
+            "total_matching": len(records),
+        }
+
+    @app.get("/v1/stats")
+    async def stats() -> dict[str, Any]:
+        """Counts by status and by capability - what an operator glances at
+        to see whether the queue is draining or a provider is failing."""
+        records = await manager.store.list()
+        by_status = {s.value: 0 for s in JobStatus}
+        by_capability: dict[str, int] = {}
+        for record in records:
+            by_status[record.status.value] = by_status.get(record.status.value, 0) + 1
+            by_capability[record.capability] = by_capability.get(record.capability, 0) + 1
+        return {
+            "total": len(records),
+            "by_status": by_status,
+            "by_capability": dict(sorted(by_capability.items())),
+            "registered_capabilities": len(manager.registry),
+        }
 
     @app.get("/v1/capabilities")
     async def list_capabilities() -> dict[str, str]:
