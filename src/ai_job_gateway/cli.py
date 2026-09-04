@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 
 
 def _serve(args: argparse.Namespace) -> None:
@@ -23,7 +24,13 @@ def _serve(args: argparse.Namespace) -> None:
 
     store = SQLiteJobStore(args.db) if args.db else InMemoryJobStore()
     manager = JobManager(store, default_registry())
-    app = create_app(manager)
+    # The API key comes from the environment, never an argv flag: process
+    # listings and shell history are not places for a credential.
+    app = create_app(
+        manager,
+        allow_private_webhooks=args.allow_private_webhooks,
+        api_key=os.environ.get("AJG_API_KEY") or None,
+    )
     uvicorn.run(app, host=args.host, port=args.port)
 
 
@@ -54,6 +61,15 @@ def main() -> None:
     serve_parser = subparsers.add_parser("serve", help="run the reference HTTP server")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
+    serve_parser.add_argument(
+        "--allow-private-webhooks",
+        action="store_true",
+        help=(
+            "permit webhook_url targets that resolve to loopback/private "
+            "addresses (the local webhook-sink workflow); off by default "
+            "because the server POSTs the full job record there"
+        ),
+    )
     serve_parser.add_argument(
         "--db",
         default=None,
