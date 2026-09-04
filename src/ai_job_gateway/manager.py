@@ -95,6 +95,27 @@ class JobManager:
         # Best-effort submission dedupe -- see MAX_IDEMPOTENCY_KEYS.
         self._idempotency_keys: dict[str, str] = {}
 
+    async def _webhook_client(self) -> httpx.AsyncClient:
+        """The HTTP client webhooks go out through, created once.
+
+        Building a client per delivery - the previous behaviour when none was
+        injected - paid the connection setup (TCP, and TLS for an https
+        receiver) on every webhook and threw the pool away afterwards. One
+        client per manager keeps connections alive across deliveries; the
+        retry loop's three attempts to the same receiver reuse one socket.
+        """
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient()
+        return self._http_client
+
+    async def aclose(self) -> None:
+        """Close the webhook client this manager created. A client that was
+        injected belongs to whoever injected it and is left alone. The app
+        factory registers this as a shutdown handler."""
+        if self._owns_http_client and self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
+
     async def submit(
         self,
         capability: str,
@@ -210,7 +231,7 @@ class JobManager:
         if not record.webhook_url:
             return
 
-        client = self._http_client or httpx.AsyncClient()
+        client = await self._webhook_client()
         # Serialized once, up front, so the bytes that get signed are
         # byte-for-byte identical to the bytes that get sent -- posting via
         # httpx's `json=` re-serializes on every attempt, which could in
@@ -253,5 +274,4 @@ class JobManager:
                 last_exc,
             )
         finally:
-            if self._owns_http_client:
-                await client.aclose()
+            pass  # the client is shared for the manager's lifetime; see aclose()

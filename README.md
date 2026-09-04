@@ -166,6 +166,8 @@ This is a single-process, in-memory, best-effort window (bounded to the 10,000 m
 
 ### Operability
 
+`GET /v1/jobs?status=ready&capability=generate-image&limit=50` lists recent jobs newest first, filtered by either or both, and `GET /v1/stats` returns counts by status and by capability — the two things an operator glances at to see whether the queue is draining or one provider is failing. Both read the store's unpaginated `list()` and filter in memory, which is the honest shape for a reference store.
+
 `GET /health` returns `{"status": "ok"}` and touches nothing but the running process — a liveness probe for a load balancer or orchestrator, independent of whatever `JobStore` backend is degraded or not.
 
 ## Using the Python client

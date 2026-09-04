@@ -212,3 +212,67 @@ async def test_submit_without_idempotency_key_creates_distinct_jobs(client):
     first = await client.post("/v1/echo", json={"prompt": "hi"})
     second = await client.post("/v1/echo", json={"prompt": "hi"})
     assert first.json()["id"] != second.json()["id"]
+
+
+# --- listing and stats -------------------------------------------------------
+
+async def test_list_jobs_returns_newest_first_with_filters(client):
+    a = (await client.post("/v1/echo", json={"n": 1})).json()
+    await _poll_until_terminal(client, a["polling_url"])
+    b = (await client.post("/v1/always-fails", json={"n": 2})).json()
+    await _poll_until_terminal(client, b["polling_url"])
+    c = (await client.post("/v1/echo", json={"n": 3})).json()
+    await _poll_until_terminal(client, c["polling_url"])
+
+    listing = (await client.get("/v1/jobs")).json()
+    assert listing["count"] == 3 and listing["total_matching"] == 3
+    assert [j["id"] for j in listing["jobs"]] == [c["id"], b["id"], a["id"]]
+
+    errors = (await client.get("/v1/jobs", params={"status": "error"})).json()
+    assert [j["id"] for j in errors["jobs"]] == [b["id"]]
+
+    echoes = (await client.get("/v1/jobs", params={"capability": "echo", "limit": 1})).json()
+    assert echoes["count"] == 1 and echoes["total_matching"] == 2
+    assert echoes["jobs"][0]["id"] == c["id"]
+
+
+async def test_list_jobs_rejects_an_unknown_status_and_a_hostile_capability(client):
+    assert (await client.get("/v1/jobs", params={"status": "finished"})).status_code == 422
+    assert (await client.get("/v1/jobs", params={"capability": "../x"})).status_code == 422
+    assert (await client.get("/v1/jobs", params={"limit": 0})).status_code == 422
+
+
+async def test_stats_counts_by_status_and_capability(client):
+    for _ in range(2):
+        r = (await client.post("/v1/echo", json={"x": 1})).json()
+        await _poll_until_terminal(client, r["polling_url"])
+    r = (await client.post("/v1/always-fails", json={"x": 1})).json()
+    await _poll_until_terminal(client, r["polling_url"])
+
+    stats = (await client.get("/v1/stats")).json()
+    assert stats["total"] == 3
+    assert stats["by_status"]["ready"] == 2 and stats["by_status"]["error"] == 1
+    assert stats["by_capability"] == {"always-fails": 1, "echo": 2}
+    assert stats["registered_capabilities"] == 3
+
+
+async def test_shutdown_closes_the_webhook_client_the_manager_created(app_and_manager):
+    """The lifespan hook is what closes the shared client; exercised through
+    the ASGI lifespan protocol rather than by calling aclose() directly."""
+    app, manager = app_and_manager
+    await manager._webhook_client()
+    assert manager._http_client is not None
+
+    scope = {"type": "lifespan"}
+    messages = iter([{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}])
+    sent = []
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        sent.append(message["type"])
+
+    await app(scope, receive, send)
+    assert "lifespan.shutdown.complete" in sent
+    assert manager._http_client is None
