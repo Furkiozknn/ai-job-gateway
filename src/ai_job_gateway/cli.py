@@ -45,7 +45,9 @@ def _submit(args: argparse.Namespace) -> None:
         if not isinstance(params, dict):
             raise SystemExit("params must be a JSON object, e.g. '{\"prompt\": \"hi\"}'")
 
-        async with JobGatewayClient(args.url) as client:
+        async with JobGatewayClient(
+            args.url, api_key=os.environ.get("AJG_API_KEY") or None
+        ) as client:
             handle = await client.submit(args.capability, params)
             print(f"submitted job {handle.job_id} -> polling {handle.polling_url}")
             result = await handle.wait(timeout=args.timeout)
