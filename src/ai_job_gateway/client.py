@@ -47,7 +47,7 @@ class JobHandle:
     async def poll(self) -> dict[str, Any]:
         """One GET against the polling URL. Returns the raw job record dict."""
         url = resolve_polling_url(self._client._base_url, self.polling_url)
-        response = await self._client._http.get(url)
+        response = await self._client._http.get(url, headers=self._client._auth_headers)
         if response.status_code == 404:
             raise JobNotFoundError(self.job_id)
         if is_expired_poll_response(response.status_code):
@@ -84,10 +84,25 @@ class JobHandle:
 class JobGatewayClient:
     """Talks to a running ai-job-gateway server."""
 
-    def __init__(self, base_url: str, *, http_client: Optional[httpx.AsyncClient] = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        api_key: Optional[str] = None,
+        http_client: Optional[httpx.AsyncClient] = None,
+    ) -> None:
+        """``api_key`` matches the server's AJG_API_KEY: when the server has
+        one, every /v1/* call needs `Authorization: Bearer <key>` - a server
+        merged that check before any client here could send it, which the
+        ecosystem audit rightly flagged as locking out every consumer,
+        including this CLI. The header is merged per request rather than
+        set on the client, so an injected http_client is never mutated."""
         self._base_url = base_url.rstrip("/")
         self._http = http_client or httpx.AsyncClient()
         self._owns_http = http_client is None
+        self._auth_headers: dict[str, str] = (
+            {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        )
 
     async def submit(
         self,
@@ -103,7 +118,9 @@ class JobGatewayClient:
         body = dict(params)
         if webhook_url:
             body["webhook_url"] = webhook_url
-        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        headers = dict(self._auth_headers)
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
         response = await self._http.post(
             submit_url(self._base_url, capability), json=body, headers=headers
         )

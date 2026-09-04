@@ -79,3 +79,49 @@ async def test_poll_raises_job_expired_error_once_past_ttl(gateway_client, monke
 
     with pytest.raises(JobExpiredError):
         await handle.poll()
+
+
+async def test_api_key_rides_on_every_request():
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, request.headers.get("authorization")))
+        if request.method == "POST":
+            return httpx.Response(202, json={"id": "j1", "polling_url": "/v1/jobs/j1"})
+        return httpx.Response(200, json={"id": "j1", "status": "ready", "result": {}})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async with JobGatewayClient("http://test", api_key="s3cret", http_client=http_client) as client:
+        handle = await client.submit("echo", {"prompt": "hi"}, idempotency_key="k-1")
+        await handle.poll()
+
+    assert [auth for _, auth in seen] == ["Bearer s3cret", "Bearer s3cret"]
+
+
+async def test_no_api_key_sends_no_authorization_header():
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization"))
+        return httpx.Response(202, json={"id": "j1", "polling_url": "/v1/jobs/j1"})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async with JobGatewayClient("http://test", http_client=http_client) as client:
+        await client.submit("echo", {"prompt": "hi"})
+
+    assert seen == [None]
+
+
+async def test_client_with_key_talks_to_a_keyed_server_end_to_end():
+    from ai_job_gateway.manager import JobManager
+    from ai_job_gateway.providers import EchoProvider
+    from ai_job_gateway.server import create_app
+    from ai_job_gateway.store import InMemoryJobStore
+    from httpx import ASGITransport
+
+    app = create_app(JobManager(InMemoryJobStore(), {"echo": EchoProvider()}), api_key="s3cret")
+    http_client = httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+    async with JobGatewayClient("http://test", api_key="s3cret", http_client=http_client) as client:
+        handle = await client.submit("echo", {"prompt": "merhaba"})
+        result = await handle.wait(timeout=5)
+    assert result["echoed"]["prompt"] == "merhaba"
