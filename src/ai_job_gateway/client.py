@@ -95,11 +95,18 @@ class JobGatewayClient:
         params: dict[str, Any],
         *,
         webhook_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> JobHandle:
+        """Submit a job. Pass ``idempotency_key`` to make a retried call safe:
+        submitting twice with the same key returns a handle to the original
+        job instead of creating a second one (see ``JobManager.submit``)."""
         body = dict(params)
         if webhook_url:
             body["webhook_url"] = webhook_url
-        response = await self._http.post(submit_url(self._base_url, capability), json=body)
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        response = await self._http.post(
+            submit_url(self._base_url, capability), json=body, headers=headers
+        )
         body_json = response.json() if response.status_code < 400 else None
         try:
             job_id, polling_url = parse_submission(response.status_code, body_json, response.text)

@@ -57,6 +57,13 @@ async def test_submit_unknown_capability_raises_job_submission_error(gateway_cli
 
 
 @pytest.mark.asyncio
+async def test_submit_with_idempotency_key_returns_same_handle_on_retry(gateway_client):
+    handle1 = await gateway_client.submit("echo", {"prompt": "hi"}, idempotency_key="retry-abc")
+    handle2 = await gateway_client.submit("echo", {"prompt": "hi"}, idempotency_key="retry-abc")
+    assert handle1.job_id == handle2.job_id
+
+
+@pytest.mark.asyncio
 async def test_poll_raises_job_expired_error_once_past_ttl(gateway_client, monkeypatch):
     from ai_job_gateway import clock
 

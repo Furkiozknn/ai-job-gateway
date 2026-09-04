@@ -139,3 +139,76 @@ async def test_submit_webhook_url_is_stripped_from_params(client, app_and_manage
     assert record.webhook_url == "https://example.test/hook"
     assert "webhook_url" not in record.params
     assert record.params == {"prompt": "hi"}
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint(client):
+    resp = await client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_submit_body_over_size_limit_is_413():
+    from ai_job_gateway.manager import JobManager
+    from ai_job_gateway.providers import EchoProvider
+    from ai_job_gateway.server import create_app
+    from ai_job_gateway.store import InMemoryJobStore
+
+    manager = JobManager(InMemoryJobStore(), {"echo": EchoProvider()})
+    app = create_app(manager, max_body_bytes=32)
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post("/v1/echo", json={"prompt": "x" * 200})
+    assert resp.status_code == 413
+
+
+@pytest.mark.parametrize(
+    "webhook_url",
+    ["ftp://example.test/hook", "file:///etc/passwd", "not-a-url", "javascript:alert(1)"],
+)
+@pytest.mark.asyncio
+async def test_submit_rejects_non_http_webhook_url(client, webhook_url):
+    resp = await client.post("/v1/echo", json={"prompt": "hi", "webhook_url": webhook_url})
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_submit_accepts_https_webhook_url(client):
+    resp = await client.post(
+        "/v1/echo", json={"prompt": "hi", "webhook_url": "https://example.test/hook"}
+    )
+    assert resp.status_code == 202
+
+
+@pytest.mark.parametrize("capability", ["has space", "slash/here", "", "x" * 101, "emoji-😀"])
+@pytest.mark.asyncio
+async def test_submit_rejects_invalid_capability_name(client, capability):
+    resp = await client.post(f"/v1/{capability}", json={"a": 1})
+    assert resp.status_code in (404, 422)
+    if capability and "/" not in capability:
+        # a syntactically-invalid-but-nonempty single path segment should be
+        # rejected as invalid input, not treated as merely "not registered"
+        assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_submit_with_repeated_idempotency_key_does_not_duplicate_job(
+    client, app_and_manager
+):
+    _, manager = app_and_manager
+    headers = {"Idempotency-Key": "retry-123"}
+    first = await client.post("/v1/echo", json={"prompt": "hi"}, headers=headers)
+    second = await client.post("/v1/echo", json={"prompt": "hi"}, headers=headers)
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert first.json()["id"] == second.json()["id"]
+    assert len(await manager.store.list()) == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_without_idempotency_key_creates_distinct_jobs(client):
+    first = await client.post("/v1/echo", json={"prompt": "hi"})
+    second = await client.post("/v1/echo", json={"prompt": "hi"})
+    assert first.json()["id"] != second.json()["id"]
