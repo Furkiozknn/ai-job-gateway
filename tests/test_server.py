@@ -8,10 +8,38 @@ import pytest
 from httpx import ASGITransport
 
 from ai_job_gateway import clock
+from ai_job_gateway import server as server_mod
 from ai_job_gateway.manager import JobManager
 from ai_job_gateway.providers import EchoProvider, MockProvider
 from ai_job_gateway.server import create_app
 from ai_job_gateway.store import InMemoryJobStore
+
+
+import ipaddress
+
+
+@pytest.fixture(autouse=True)
+def _public_dns(monkeypatch):
+    """Resolve every test hostname to a public address, with no real DNS.
+
+    Tests that exercise the SSRF check override this per-host; everything
+    else keeps using names like example.test without touching the network.
+    """
+    def resolve(host):
+        # Mirror the real function's literal-IP fast path so the address
+        # checks stay exercised; only actual DNS is replaced.
+        try:
+            return [ipaddress.ip_address(host)]
+        except ValueError:
+            return [ipaddress.ip_address("93.184.216.34")]
+
+    monkeypatch.setattr(server_mod, "_resolve_host", resolve)
+
+
+def _resolving_to(monkeypatch, mapping):
+    def resolve(host):
+        return [ipaddress.ip_address(a) for a in mapping[host]]
+    monkeypatch.setattr(server_mod, "_resolve_host", resolve)
 
 
 @pytest.fixture
@@ -276,3 +304,115 @@ async def test_shutdown_closes_the_webhook_client_the_manager_created(app_and_ma
     await app(scope, receive, send)
     assert "lifespan.shutdown.complete" in sent
     assert manager._http_client is None
+
+
+class TestWebhookHostRestriction:
+    """The server will not be pointed at its own network. Verified SSRF fix."""
+
+    @pytest.mark.parametrize("address", [
+        "127.0.0.1",          # loopback
+        "169.254.169.254",    # cloud metadata, the classic target
+        "10.0.0.5",           # RFC-1918
+        "192.168.1.20",       # RFC-1918
+        "::1",                # IPv6 loopback
+        "fd00::1",            # IPv6 ULA
+        "0.0.0.0",            # unspecified
+    ])
+    async def test_literal_non_public_addresses_are_rejected(self, client, address):
+        host = f"[{address}]" if ":" in address else address
+        resp = await client.post(
+            "/v1/echo", json={"prompt": "hi", "webhook_url": f"http://{host}:9200/hook"}
+        )
+        assert resp.status_code == 422
+        assert "non-public" in resp.json()["detail"]
+
+    async def test_a_hostname_resolving_privately_is_rejected(self, client, monkeypatch):
+        _resolving_to(monkeypatch, {"internal.corp": ["10.1.2.3"]})
+        resp = await client.post(
+            "/v1/echo", json={"prompt": "hi", "webhook_url": "https://internal.corp/hook"}
+        )
+        assert resp.status_code == 422
+
+    async def test_dual_answer_with_one_private_address_is_rejected(self, client, monkeypatch):
+        _resolving_to(monkeypatch, {"tricky.example": ["93.184.216.34", "127.0.0.1"]})
+        resp = await client.post(
+            "/v1/echo", json={"prompt": "hi", "webhook_url": "https://tricky.example/hook"}
+        )
+        assert resp.status_code == 422
+
+    async def test_an_unresolvable_host_fails_closed(self, client, monkeypatch):
+        import socket as socket_mod
+
+        def boom(host):
+            raise socket_mod.gaierror(-2, "Name or service not known")
+
+        monkeypatch.setattr(server_mod, "_resolve_host", boom)
+        resp = await client.post(
+            "/v1/echo", json={"prompt": "hi", "webhook_url": "https://gone.example/hook"}
+        )
+        assert resp.status_code == 422
+        assert "did not resolve" in resp.json()["detail"]
+
+    async def test_public_hosts_still_work(self, client):
+        resp = await client.post(
+            "/v1/echo", json={"prompt": "hi", "webhook_url": "https://example.test/hook"}
+        )
+        assert resp.status_code == 202
+
+    async def test_allow_private_webhooks_restores_the_local_dev_flow(self):
+        manager = JobManager(InMemoryJobStore(), {"echo": EchoProvider()})
+        app = create_app(manager, allow_private_webhooks=True)
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            resp = await c.post(
+                "/v1/echo", json={"prompt": "hi", "webhook_url": "http://127.0.0.1:9999/hook"}
+            )
+        assert resp.status_code == 202
+
+    async def test_scheme_check_still_runs_when_private_is_allowed(self):
+        manager = JobManager(InMemoryJobStore(), {"echo": EchoProvider()})
+        app = create_app(manager, allow_private_webhooks=True)
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            resp = await c.post(
+                "/v1/echo", json={"prompt": "hi", "webhook_url": "file:///etc/passwd"}
+            )
+        assert resp.status_code == 422
+
+
+class TestApiKey:
+    """With api_key set, /v1/* requires the bearer token; /health stays open."""
+
+    @pytest.fixture
+    async def keyed_client(self):
+        manager = JobManager(InMemoryJobStore(), {"echo": EchoProvider()})
+        app = create_app(manager, api_key="s3cret")
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            yield c
+
+    @pytest.mark.parametrize("path", ["/v1/jobs", "/v1/jobs/abc", "/v1/stats", "/v1/capabilities"])
+    async def test_reads_require_the_key(self, keyed_client, path):
+        assert (await keyed_client.get(path)).status_code == 401
+
+    async def test_submit_requires_the_key(self, keyed_client):
+        resp = await keyed_client.post("/v1/echo", json={"prompt": "hi"})
+        assert resp.status_code == 401
+
+    async def test_the_right_key_works_and_the_wrong_one_does_not(self, keyed_client):
+        ok = await keyed_client.post(
+            "/v1/echo", json={"prompt": "hi"},
+            headers={"Authorization": "Bearer s3cret"},
+        )
+        assert ok.status_code == 202
+        bad = await keyed_client.get(
+            "/v1/jobs", headers={"Authorization": "Bearer wrong"}
+        )
+        assert bad.status_code == 401
+
+    async def test_health_stays_open(self, keyed_client):
+        assert (await keyed_client.get("/health")).status_code == 200
+
+    async def test_no_key_configured_keeps_the_open_behavior(self, client):
+        assert (await client.get("/v1/jobs")).status_code == 200
+

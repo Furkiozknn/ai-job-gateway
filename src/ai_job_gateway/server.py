@@ -17,8 +17,12 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
+import asyncio
+import hmac
+import ipaddress
 import json
 import re
+import socket
 from typing import Optional, Any
 from urllib.parse import urlsplit
 
@@ -53,14 +57,32 @@ _CAPABILITY_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 #: costs no legitimate caller anything (a webhook receiver is always
 #: http(s)) while rejecting schemes like `file://` or `gopher://` that exist
 #: only to make an HTTP client do something other than an HTTP request.
-#: Blocking specific *hosts* (loopback, link-local/cloud-metadata, private
-#: ranges) is deliberately NOT done here -- see the security notes in the
-#: README: this reference server's own documented local-dev workflow (and
-#: its sibling webhook-sink project) is a webhook_url pointing at
-#: 127.0.0.1/localhost, so host-level SSRF blocking belongs at the network
-#: layer of a real deployment, not hardcoded into a reference gateway that
-#: would then be unable to demo its own webhook feature.
+#: Blocking specific *hosts* is the other half. A submitter who can name any
+#: URL can point this server's outbound POST -- carrying the full job record
+#: -- at 169.254.169.254 (cloud metadata), 127.0.0.1:<internal port>, or an
+#: RFC-1918 neighbour. So by default the hostname is resolved at submission
+#: time and the URL is rejected if any resolved address is loopback,
+#: private, link-local, reserved, multicast or unspecified. The documented
+#: local-dev workflow (webhook-sink on 127.0.0.1) opts back in with
+#: `create_app(..., allow_private_webhooks=True)` / `serve
+#: --allow-private-webhooks`. Known residue, on purpose: resolution happens
+#: once at submission, so a DNS name that flips to a private address between
+#: validation and delivery (rebinding) is not caught -- closing that needs
+#: resolution pinning inside the HTTP client, which is beyond what a
+#: reference implementation should hand-roll. The check fails closed: a
+#: hostname that does not resolve is a 422, because "could not check" must
+#: not become "allowed".
 _ALLOWED_WEBHOOK_SCHEMES = {"http", "https"}
+
+
+def _resolve_host(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Every address ``host`` resolves to. Module-level so tests stub DNS out."""
+    try:
+        return [ipaddress.ip_address(host)]
+    except ValueError:
+        pass
+    infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    return [ipaddress.ip_address(info[4][0]) for info in infos]
 
 
 async def _read_capped_body(request: Request, max_bytes: int) -> bytes:
@@ -88,7 +110,7 @@ async def _read_capped_body(request: Request, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-def _validate_webhook_url(webhook_url: Any) -> None:
+async def _validate_webhook_url(webhook_url: Any, *, allow_private: bool) -> None:
     if webhook_url is None:
         return
     if not isinstance(webhook_url, str):
@@ -99,15 +121,54 @@ def _validate_webhook_url(webhook_url: Any) -> None:
             422,
             "webhook_url must be an absolute http:// or https:// URL",
         )
+    if allow_private:
+        return
+    host = parts.hostname or ""
+    try:
+        addresses = await asyncio.get_running_loop().run_in_executor(
+            None, _resolve_host, host
+        )
+    except (socket.gaierror, UnicodeError, OSError):
+        raise HTTPException(
+            422,
+            f"webhook_url host {host!r} did not resolve; a webhook target must be reachable",
+        ) from None
+    for address in addresses:
+        if not address.is_global:
+            raise HTTPException(
+                422,
+                "webhook_url resolves to a private, loopback or otherwise "
+                "non-public address, which this server will not call. Run with "
+                "--allow-private-webhooks to permit this in local development.",
+            )
 
 
-def create_app(manager: JobManager, *, max_body_bytes: int = DEFAULT_MAX_BODY_BYTES) -> FastAPI:
+def create_app(
+    manager: JobManager,
+    *,
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    allow_private_webhooks: bool = False,
+    api_key: Optional[str] = None,
+) -> FastAPI:
     """Build a FastAPI app wired to the given JobManager.
 
     A factory rather than a module-level singleton so tests (and anything
     embedding this server) can spin up multiple independent apps, each with
     its own store/registry, in the same process.
+
+    ``api_key`` set makes every ``/v1/*`` route require ``Authorization:
+    Bearer <key>`` (compared constant-time); ``/health`` stays open, it is a
+    liveness probe. Unset keeps the historical open behavior, which is
+    acceptable only on the default 127.0.0.1 bind.
     """
+
+    def _require_api_key(request: Request) -> None:
+        if api_key is None:
+            return
+        supplied = request.headers.get("authorization", "")
+        expected = f"Bearer {api_key}"
+        if not hmac.compare_digest(supplied.encode(), expected.encode()):
+            raise HTTPException(401, "missing or invalid API key")
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
         try:
@@ -129,6 +190,7 @@ def create_app(manager: JobManager, *, max_body_bytes: int = DEFAULT_MAX_BODY_BY
 
     @app.post("/v1/{capability}", status_code=202)
     async def submit(capability: str, request: Request) -> dict[str, str]:
+        _require_api_key(request)
         if not _CAPABILITY_NAME_RE.match(capability):
             raise HTTPException(
                 422,
@@ -145,7 +207,7 @@ def create_app(manager: JobManager, *, max_body_bytes: int = DEFAULT_MAX_BODY_BY
 
         params: dict[str, Any] = dict(body)
         webhook_url = params.pop("webhook_url", None)
-        _validate_webhook_url(webhook_url)
+        await _validate_webhook_url(webhook_url, allow_private=allow_private_webhooks)
 
         idempotency_key = request.headers.get("idempotency-key") or None
 
@@ -159,7 +221,8 @@ def create_app(manager: JobManager, *, max_body_bytes: int = DEFAULT_MAX_BODY_BY
         return {"id": record.id, "polling_url": f"/v1/jobs/{record.id}"}
 
     @app.get("/v1/jobs/{job_id}")
-    async def get_job(job_id: str) -> dict[str, Any]:
+    async def get_job(job_id: str, request: Request) -> dict[str, Any]:
+        _require_api_key(request)
         record = await manager.store.get(job_id)
         if record is None:
             raise HTTPException(404, f"no job with id {job_id!r}")
@@ -169,6 +232,7 @@ def create_app(manager: JobManager, *, max_body_bytes: int = DEFAULT_MAX_BODY_BY
 
     @app.get("/v1/jobs")
     async def list_jobs(
+        request: Request,
         status: Optional[str] = None,
         capability: Optional[str] = None,
         limit: int = Query(default=50, ge=1, le=500),
@@ -182,6 +246,7 @@ def create_app(manager: JobManager, *, max_body_bytes: int = DEFAULT_MAX_BODY_BY
         that documents itself as unpaginated; a real deployment's store would
         push both into the query.
         """
+        _require_api_key(request)
         wanted_status: Optional[JobStatus] = None
         if status is not None:
             try:
@@ -207,7 +272,8 @@ def create_app(manager: JobManager, *, max_body_bytes: int = DEFAULT_MAX_BODY_BY
         }
 
     @app.get("/v1/stats")
-    async def stats() -> dict[str, Any]:
+    async def stats(request: Request) -> dict[str, Any]:
+        _require_api_key(request)
         """Counts by status and by capability - what an operator glances at
         to see whether the queue is draining or a provider is failing."""
         records = await manager.store.list()
@@ -224,7 +290,8 @@ def create_app(manager: JobManager, *, max_body_bytes: int = DEFAULT_MAX_BODY_BY
         }
 
     @app.get("/v1/capabilities")
-    async def list_capabilities() -> dict[str, str]:
+    async def list_capabilities(request: Request) -> dict[str, str]:
+        _require_api_key(request)
         return {capability: provider.name for capability, provider in manager.registry.items()}
 
     @app.get("/health")
