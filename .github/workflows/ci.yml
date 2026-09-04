@@ -15,8 +15,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      # `--extra media` pulls mini-creative-toolkit from GitHub so the local
+      # media capabilities are tested for real, not just skipped.
       - name: Install dependencies
-        run: uv sync --group dev
+        run: uv sync --group dev --extra media
 
       - name: Run tests
         run: uv run pytest -v
+
+      # Without the extra, the media-* capabilities must simply be absent and
+      # everything else - including the real hosted provider - must still pass.
+      - name: Tests still pass without the media extra
+        run: |
+          uv sync --group dev
+          uv run pytest -v -q

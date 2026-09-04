@@ -9,6 +9,8 @@ Public surface::
         JobManager,         # server-side orchestration: store + provider registry
         JobRecord, JobStatus,
         Provider, EchoProvider, MockProvider, ProviderError,
+        PollinationsImageProvider,            # hosted, keyless image generation
+        LocalMediaProvider, local_media_registry,  # local media ops (extra: media)
         JobStore, InMemoryJobStore, SQLiteJobStore,
         create_app,         # FastAPI app factory
     )
@@ -27,6 +29,8 @@ from .exceptions import (
 from .manager import JobManager
 from .models import JobRecord, JobStatus
 from .providers import EchoProvider, MockProvider, Provider, ProviderError
+from .providers_local import LocalMediaProvider, local_media_registry
+from .providers_pollinations import PollinationsImageProvider
 from .server import create_app
 from .store import InMemoryJobStore, JobStore, SQLiteJobStore
 
@@ -45,6 +49,9 @@ __all__ = [
     "MockProvider",
     "Provider",
     "ProviderError",
+    "PollinationsImageProvider",
+    "LocalMediaProvider",
+    "local_media_registry",
     "create_app",
     "InMemoryJobStore",
     "JobStore",

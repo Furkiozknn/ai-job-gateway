@@ -20,6 +20,13 @@ dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
 ]
+# Local media capabilities (media-resize, media-upscale, ...). Optional so the
+# gateway itself stays a four-dependency reference server; opt in to get real
+# local work. Pinned to a commit in uv.lock; bump with
+# `uv lock --upgrade-package mini-creative-toolkit`.
+media = [
+    "mini-creative-toolkit @ git+https://github.com/Furkiozknn/mini-creative-toolkit.git",
+]
 
 [project.scripts]
 ai-job-gateway = "ai_job_gateway.cli:main"
@@ -30,6 +37,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ai_job_gateway"]
+
+# The `media` extra points at a git URL. Hatchling refuses direct references
+# by default because PyPI would reject them; this package is not on PyPI.
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

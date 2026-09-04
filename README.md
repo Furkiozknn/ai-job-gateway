@@ -67,10 +67,46 @@ class MyImageProvider(Provider):
 
 Register it: `JobManager(store, {"my-capability": MyImageProvider(...)})` — it's live under `POST /v1/my-capability`. No base-class state, no lifecycle hooks required beyond `run()`.
 
-Two providers ship out of the box, needing no network, API key, or GPU, so the whole system is testable and demoable on its own:
+## Providers that ship
+
+The default registry (`ai-job-gateway serve`, `GET /v1/capabilities`) is no longer only demos. Every capability states where it runs and what it needs:
+
+| Capability | Provider | Runs | Needs | Notes |
+| --- | --- | --- | --- | --- |
+| `echo` | `EchoProvider` | local | nothing | Returns its params. The "hello world". |
+| `mock-generate` | `MockProvider` | local | nothing | Configurable delay, can be flipped to fail. For tests and demos. |
+| `generate-image` | `PollinationsImageProvider` | **hosted** | network | Real text-to-image via Pollinations.ai. **No API key**, but the prompt leaves the machine. |
+| `media-resize`, `media-convert`, `media-strip-metadata`, `media-watermark`, `media-remove-background`, `media-upscale`, `media-optimize`, `media-inspect`, `media-thumbnail`, `media-extract-audio` | `LocalMediaProvider` | local | the `media` extra | Real local media work via [mini-creative-toolkit](https://github.com/Furkiozknn/mini-creative-toolkit). Registered only when it is installed. |
+
+```bash
+uv sync --extra media      # opt in to the local media capabilities
+uv run ai-job-gateway serve
+curl -s http://127.0.0.1:8000/v1/capabilities
+# {"mock-generate": "mock", "echo": "echo", "generate-image": "pollinations",
+#  "media-resize": "local-media:resize", "media-upscale": "local-media:upscale", ...}
+```
+
+A real two-step run, no key anywhere:
+
+```bash
+uv run ai-job-gateway submit generate-image '{"prompt": "a lighthouse at dusk", "width": 768, "height": 512}'
+# {"output_path": "output/<job-id>.jpg", "format": "jpg", "execution": "hosted", "service": "Pollinations.ai", ...}
+uv run ai-job-gateway submit media-upscale '{"image_path": "output/<job-id>.jpg", "scale": 2}'
+# {"output_path": "...", "selected_method": "fsrcnn", "selection_reason": "...", "execution": "local", ...}
+```
+
+This is exactly the chain [ai-workflow-engine](https://github.com/Furkiozknn/ai-workflow-engine) runs as a YAML pipeline (`generate → upscale`), so that pipeline now does real work end to end.
+
+### What the real providers guarantee
+
+**`generate-image`** is the only capability that leaves the machine, and it says so in every result (`"execution": "hosted"`, a `disclosure` field). The response is never trusted: status, content type, a streaming byte budget (`max_download_bytes`, default 64 MB) and the image's magic bytes are all checked before anything is written, so an HTML error page served with HTTP 200 is refused rather than saved as a `.jpg`. Output lands in `GATEWAY_OUTPUT_DIR` (default `./output`), named by job id after sanitising. The prompt is never logged. If the service ever starts requiring a key, that returns a specific error and nothing else in the gateway is affected.
+
+**`media-*`** run entirely locally, in a worker thread so the event loop keeps serving polls. Params are the toolkit tool's own keyword arguments (`image_path`, `width`, `goal`, ...); anything the tool does not declare is refused, and `config` is reserved. Path validation, size limits and the `MCT_ALLOWED_ROOTS` restriction are the toolkit's and apply to the gateway process's environment — set `MCT_ALLOWED_ROOTS` if the gateway is reachable by callers you do not fully trust, because a local job reads and writes files as the user running the server. The gateway and the toolkit share a filesystem; that is the deployment model, not an oversight.
+
+The two demo providers remain:
 
 - **`EchoProvider`** (`echo`) — returns the params it was given. The "hello world" capability.
-- **`MockProvider`** (`mock-generate` in the default registry) — simulates configurable delay and can be flipped to always fail, for exercising both the happy path and the error path.
+- **`MockProvider`** (`mock-generate`) — simulates configurable delay and can be flipped to always fail, for exercising both the happy path and the error path.
 
 ## Running the reference server
 
@@ -92,7 +128,7 @@ curl -s http://127.0.0.1:8000/v1/jobs/$(python3 -c "import json;print(json.load(
 # {"id": "…", "status": "ready", "result": {…}, "result_expires_at": "…"}
 
 curl -s http://127.0.0.1:8000/v1/capabilities
-# {"mock-generate": "mock", "echo": "echo"}
+# {"mock-generate": "mock", "echo": "echo", "generate-image": "pollinations", ...}
 ```
 
 Or use the bundled CLI convenience for the same round-trip:
