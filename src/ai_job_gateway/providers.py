@@ -1,12 +1,12 @@
-"""The Provider interface, plus two example implementations.
+"""The Provider interface, plus the two demo implementations.
 
 A provider is the pluggable seam of this whole project: everything else
 (the job manager, the HTTP API, the client) is generic over "some async
-callable that turns params into a result dict." A real deployment would
-implement one `Provider` per backend -- a FLUX wrapper, a Wan2.2 wrapper, a
-MuseTalk wrapper -- and register it under a capability name. This repo ships
-two providers that need no network, no API key, and no GPU, so the rest of
-the system is fully testable and demoable on its own.
+callable that turns params into a result dict." This module holds the
+interface and two providers that need no network, no API key and no GPU, so
+the rest of the system is testable on its own. The real ones live next door:
+`providers_pollinations` (hosted, keyless image generation) and
+`providers_local` (local media operations via mini-creative-toolkit).
 """
 
 from __future__ import annotations
@@ -134,8 +134,20 @@ class MockProvider(Provider):
 
 
 def default_registry() -> dict[str, Provider]:
-    """A small, ready-to-run registry used by the CLI's ``serve`` command."""
-    return {
+    """The registry the CLI's ``serve`` command runs.
+
+    Two demo providers, one real hosted one, and - when the ``media`` extra
+    is installed - the local media operations. ``GET /v1/capabilities`` shows
+    exactly which of these are live in a given process.
+    """
+    from .providers_local import local_media_registry, toolkit_available
+    from .providers_pollinations import PollinationsImageProvider
+
+    registry: dict[str, Provider] = {
         "mock-generate": MockProvider(delay_seconds=(0.5, 2.0)),
         "echo": EchoProvider(),
+        "generate-image": PollinationsImageProvider(),
     }
+    if toolkit_available():
+        registry.update(local_media_registry())
+    return registry
