@@ -146,7 +146,7 @@ curl -X POST http://127.0.0.1:8000/v1/mock-generate \
   -d '{"prompt": "a cat", "webhook_url": "https://your-server.example/hooks/job-done"}'
 ```
 
-Your endpoint receives a `POST` with the full job record as JSON once the job reaches `ready` or `error`. Delivery retries up to 3 times with backoff on failure; if every attempt fails, it's logged and dropped — the job's own status in the store is already correct regardless of whether the webhook ever arrives, so a caller relying on polling as a fallback is never left with stale state.
+Your endpoint receives a `POST` with the full job record as JSON once the job reaches `ready` or `error`. Delivery makes up to 5 attempts with capped exponential backoff and full jitter (delay before retry *n* is uniform in `[0, min(30s, 1s·2ⁿ⁻¹)]` — randomized so a herd of jobs finishing during a receiver outage doesn't re-synchronize its retries onto the recovering receiver). The outcome is recorded on the job record as `webhook_status`: `"delivered"` after a 2xx, `"failed"` once every attempt is exhausted — the dead-letter signal, queryable via `GET /v1/jobs/{id}`. The job's own status in the store is already correct regardless of whether the webhook ever arrives, so a caller relying on polling as a fallback is never left with stale state.
 
 `webhook_url` must be an absolute `http://` or `https://` URL — anything else (`file://`, `javascript:`, a bare hostname) is rejected with `422` at submission time, before it's ever stored or dialed. Point it at any local HTTP listener that logs incoming requests to inspect deliveries and exercise the retry behavior against a real server instead of a mock transport.
 
@@ -162,7 +162,11 @@ curl -X POST http://127.0.0.1:8000/v1/mock-generate \
   -d '{"prompt": "a cat"}'
 ```
 
-This is a single-process, in-memory, best-effort window (bounded to the 10,000 most recent keys) — it does not survive a restart and isn't shared across processes, matching this repo's existing `InMemoryJobStore` honesty about what "reference implementation" means. Omit the header and every submission is independent, exactly as before.
+The dedupe window is bounded to the 10,000 most recent keys and lives in the job store: with `SQLiteJobStore` it **survives a restart** — a deploy mid-request is exactly when a lost response gets retried, so restart-volatile dedupe would fail at the moment it matters (with `InMemoryJobStore` it is as volatile as the jobs themselves). Omit the header and every submission is independent, exactly as before.
+
+### Restart recovery
+
+Background tasks die with the process, so a job still `pending`/`processing` in a persistent store at startup has nothing driving it anymore. On startup the server sweeps these and marks each `error` with an explicit "interrupted by a gateway restart; submit the job again" message (and fires its webhook, if any) instead of letting it read `processing` forever. Providers are deliberately **not** re-run automatically — whether a half-finished generation's side effects are safe to repeat is the caller's decision, made by resubmitting with a fresh idempotency key.
 
 ### Operability
 
@@ -215,7 +219,7 @@ This is a reference implementation; it's honest about what it isn't:
 - **Real job queue.** The in-process `asyncio.create_task` model is fine for one server process. Real traffic needs a real queue (Redis/RQ, Celery, or dispatching to serverless GPU workers) so job execution survives a server restart and scales past one machine.
 - **Auth & rate limiting.** There is none. A public deployment needs API keys and per-key quotas before this is safe to expose.
 - **Real providers.** `EchoProvider`/`MockProvider` prove the contract; a real deployment implements `Provider` for actual backends (FLUX, Wan2.2, MuseTalk, whatever).
-- **Multi-worker/multi-process coordination.** `InMemoryJobStore` doesn't share state across processes; `SQLiteJobStore` survives a restart but isn't built for concurrent multi-process writers. A real deployment at that scale wants Postgres (or similar) behind the same `JobStore` interface. The idempotency-key dedupe window described above has the same limitation.
+- **Multi-worker/multi-process coordination.** `InMemoryJobStore` doesn't share state across processes; `SQLiteJobStore` survives a restart and takes its write locks eagerly (`BEGIN IMMEDIATE`, so a second process queues on `busy_timeout` instead of deadlock-aborting), but SQLite is still a single-writer database. A real deployment at that scale wants Postgres (or similar) behind the same `JobStore` interface.
 - **DNS-rebinding-proof webhook delivery.** See Security notes above — submission-time resolution is checked; pinning resolution at delivery time is left to deployments that need it.
 - **Adaptive batching / multi-stage pipelines.** Out of scope here — see this project's sibling research notes on generative-AI infrastructure patterns for where that fits in a larger system.
 

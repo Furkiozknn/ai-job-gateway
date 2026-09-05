@@ -42,3 +42,10 @@ class JobRecord(BaseModel):
     error: Optional[str] = None
     result_expires_at: Optional[datetime] = None
     webhook_url: Optional[str] = None
+    #: Outcome of webhook delivery for this job, once attempted:
+    #: "delivered" after a 2xx, "failed" once every retry is exhausted
+    #: (the dead-letter signal - the job's own status is never touched by
+    #: delivery failing, so without this field a lost webhook was
+    #: invisible). None while delivery is pending or when no webhook_url
+    #: was given.
+    webhook_status: Optional[str] = None

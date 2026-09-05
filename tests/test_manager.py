@@ -122,8 +122,9 @@ async def test_webhook_never_raises_and_job_status_unaffected_on_delivery_failur
     import ai_job_gateway.manager as manager_module
 
     # Shrink the retry backoff so the (deliberately failing) delivery loop
-    # exhausts quickly instead of taking several real seconds.
-    monkeypatch.setattr(manager_module, "WEBHOOK_RETRY_DELAYS", (0.01, 0.01))
+    # exhausts quickly instead of taking many real seconds.
+    monkeypatch.setattr(manager_module, "WEBHOOK_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(manager_module, "WEBHOOK_BACKOFF_CAP_SECONDS", 0.01)
 
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500)
@@ -165,6 +166,15 @@ async def test_store_failure_during_processing_transition_ends_job_as_error(stor
 
         async def list(self):
             return await self._inner.list()
+
+        async def remember_idempotency_key(self, key, job_id):
+            await self._inner.remember_idempotency_key(key, job_id)
+
+        async def recall_idempotency_key(self, key):
+            return await self._inner.recall_idempotency_key(key)
+
+        async def set_webhook_status(self, job_id, webhook_status):
+            await self._inner.set_webhook_status(job_id, webhook_status)
 
     flaky = FlakyStore(store)
     manager = JobManager(flaky, {"mock-generate": MockProvider(delay_seconds=0.01)})
@@ -344,3 +354,136 @@ async def test_an_injected_client_is_never_closed_by_the_manager():
     await manager.aclose()
     assert not client.is_closed
     await client.aclose()
+
+
+# --- durability: the three failure modes the ecosystem audit demonstrated ---
+
+
+@pytest.mark.asyncio
+async def test_idempotency_key_survives_a_restart_with_a_sqlite_store(tmp_path):
+    """The audit's proven double-run: submit, restart the gateway (new store
+    instance over the same file, new manager), retry the same key -- the
+    provider must not run a second time."""
+    from ai_job_gateway.store import SQLiteJobStore
+
+    path = str(tmp_path / "jobs.db")
+    run_count = 0
+
+    class CountingProvider(MockProvider):
+        name = "counting"
+
+        async def run(self, job_id, params):
+            nonlocal run_count
+            run_count += 1
+            return await super().run(job_id, params)
+
+    store1 = SQLiteJobStore(path)
+    manager1 = JobManager(store1, {"counting": CountingProvider(delay_seconds=0.01)})
+    first = await manager1.submit("counting", {"a": 1}, idempotency_key="retry-across-restart")
+    await _wait_until_terminal(store1, first.id)
+    store1.close()
+
+    store2 = SQLiteJobStore(path)
+    manager2 = JobManager(store2, {"counting": CountingProvider(delay_seconds=0.01)})
+    second = await manager2.submit("counting", {"a": 1}, idempotency_key="retry-across-restart")
+    store2.close()
+
+    assert second.id == first.id
+    assert run_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_interrupted_jobs_fails_stranded_jobs_honestly(store):
+    """A job the previous process left processing has no task driving it;
+    the startup sweep must land it in `error` with a resubmit message, and
+    leave finished jobs alone."""
+    manager = JobManager(store, {"mock-generate": MockProvider(delay_seconds=0.01)})
+
+    done = await manager.submit("mock-generate", {})
+    await _wait_until_terminal(store, done.id)
+
+    from ai_job_gateway.models import JobRecord
+
+    now = clock.now()
+    stranded = JobRecord(
+        id="stranded-1", capability="mock-generate", provider="mock",
+        params={}, status=JobStatus.PROCESSING, created_at=now, updated_at=now,
+    )
+    await store.create(stranded)
+
+    recovered = await manager.recover_interrupted_jobs()
+    assert recovered == 1
+
+    failed = await store.get("stranded-1")
+    assert failed.status == JobStatus.ERROR
+    assert "restart" in failed.error
+
+    untouched = await store.get(done.id)
+    assert untouched.status == JobStatus.READY
+
+
+@pytest.mark.asyncio
+async def test_webhook_outcome_recorded_as_delivered(store):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    manager = JobManager(store, {"mock-generate": MockProvider(delay_seconds=0.01)}, http_client=http_client)
+
+    record = await manager.submit("mock-generate", {}, webhook_url="https://example.test/hook")
+    await _wait_until_terminal(store, record.id)
+    for _ in range(100):
+        fetched = await store.get(record.id)
+        if fetched.webhook_status is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert fetched.webhook_status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_webhook_exhaustion_dead_letters_the_job(store, monkeypatch):
+    import ai_job_gateway.manager as manager_module
+
+    monkeypatch.setattr(manager_module, "WEBHOOK_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(manager_module, "WEBHOOK_BACKOFF_CAP_SECONDS", 0.01)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    manager = JobManager(store, {"mock-generate": MockProvider(delay_seconds=0.01)}, http_client=http_client)
+
+    record = await manager.submit("mock-generate", {}, webhook_url="https://example.test/hook")
+    await _wait_until_terminal(store, record.id)
+    for _ in range(100):
+        fetched = await store.get(record.id)
+        if fetched.webhook_status is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert fetched.webhook_status == "failed"
+    assert fetched.status == JobStatus.READY  # delivery failing never touches the job itself
+
+
+def test_webhook_backoff_is_capped_exponential_with_full_jitter():
+    from ai_job_gateway.manager import (
+        WEBHOOK_BACKOFF_BASE_SECONDS,
+        WEBHOOK_BACKOFF_CAP_SECONDS,
+        WEBHOOK_MAX_ATTEMPTS,
+        _webhook_backoff_delays,
+    )
+
+    seen_bounds = []
+
+    def fake_rng(low, high):
+        seen_bounds.append((low, high))
+        return high  # deterministic: always the upper bound
+
+    delays = _webhook_backoff_delays(rng=fake_rng)
+    assert len(delays) == WEBHOOK_MAX_ATTEMPTS - 1
+    # Upper bounds double from the base and never exceed the cap.
+    expected = [
+        min(WEBHOOK_BACKOFF_CAP_SECONDS, WEBHOOK_BACKOFF_BASE_SECONDS * (2**n))
+        for n in range(WEBHOOK_MAX_ATTEMPTS - 1)
+    ]
+    assert delays == expected
+    assert all(low == 0.0 for low, _ in seen_bounds)  # full jitter: floor is zero
