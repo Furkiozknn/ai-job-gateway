@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import json
 import logging
+import random
 import uuid
 from datetime import timedelta
 from typing import Optional
@@ -33,17 +34,6 @@ from .providers import Provider
 from .store import JobStore
 
 logger = logging.getLogger(__name__)
-
-#: How many recent (idempotency_key -> job_id) pairs to remember. Bounded so
-#: a client that mints a fresh key per call forever can't grow this without
-#: limit -- the oldest entries are evicted first once the cap is hit. This is
-#: a single-process, in-memory best-effort dedupe window (like
-#: `InMemoryJobStore`, it does not survive a restart and is not shared across
-#: processes); it exists to absorb the common case a caller's own retry
-#: logic creates -- a submission whose response was lost to a network blip,
-#: retried with the same key -- not to provide exactly-once semantics across
-#: a distributed deployment.
-MAX_IDEMPOTENCY_KEYS = 10_000
 
 #: HTTP header a webhook delivery carries the payload's HMAC-SHA256 signature
 #: in, when JobManager was constructed with a `webhook_signing_secret`. A
@@ -60,8 +50,25 @@ WEBHOOK_SIGNATURE_HEADER = "X-Gateway-Signature"
 DEFAULT_RESULT_TTL = timedelta(minutes=30)
 
 WEBHOOK_TIMEOUT_SECONDS = 10.0
-#: Delivery attempts beyond the first, with the delay (seconds) before each.
-WEBHOOK_RETRY_DELAYS = (1.0, 2.0, 4.0)
+#: Webhook delivery: total attempts, and the capped-exponential full-jitter
+#: backoff between them. The delay before retry n is uniform in
+#: [0, min(cap, base * 2**(n-1))] -- full jitter, per the standard AWS
+#: analysis: when a receiver hiccups, many jobs finish and retry at once,
+#: and fixed delays re-synchronize that herd onto the recovering receiver
+#: at exactly the same instants.
+WEBHOOK_MAX_ATTEMPTS = 5
+WEBHOOK_BACKOFF_BASE_SECONDS = 1.0
+WEBHOOK_BACKOFF_CAP_SECONDS = 30.0
+
+
+def _webhook_backoff_delays(rng=random.uniform) -> list[float]:
+    """The randomized delays before each retry (the first attempt is
+    immediate and not represented here). Module-level and rng-injectable so
+    the shape is testable without sleeping."""
+    return [
+        rng(0.0, min(WEBHOOK_BACKOFF_CAP_SECONDS, WEBHOOK_BACKOFF_BASE_SECONDS * (2**n)))
+        for n in range(WEBHOOK_MAX_ATTEMPTS - 1)
+    ]
 
 
 class JobManager:
@@ -92,8 +99,6 @@ class JobManager:
         # only weakly holds tasks created with create_task, so without this a
         # task can be garbage-collected mid-run.
         self._background_tasks: set[asyncio.Task] = set()
-        # Best-effort submission dedupe -- see MAX_IDEMPOTENCY_KEYS.
-        self._idempotency_keys: dict[str, str] = {}
 
     async def _webhook_client(self) -> httpx.AsyncClient:
         """The HTTP client webhooks go out through, created once.
@@ -143,7 +148,7 @@ class JobManager:
             raise UnknownCapabilityError(capability)
 
         if idempotency_key is not None:
-            existing_id = self._idempotency_keys.get(idempotency_key)
+            existing_id = await self.store.recall_idempotency_key(idempotency_key)
             if existing_id is not None:
                 existing = await self.store.get(existing_id)
                 if existing is not None:
@@ -166,9 +171,12 @@ class JobManager:
         await self.store.create(record)
 
         if idempotency_key is not None:
-            if len(self._idempotency_keys) >= MAX_IDEMPOTENCY_KEYS:
-                self._idempotency_keys.pop(next(iter(self._idempotency_keys)))
-            self._idempotency_keys[idempotency_key] = record.id
+            # Persisted in the store (not a manager-local dict, as it used
+            # to be): dedupe that evaporates on restart fails exactly when
+            # it's needed most -- a deploy mid-request is the classic way a
+            # response gets lost and the client's retry double-runs the
+            # provider. Demonstrated live in the ecosystem audit.
+            await self.store.remember_idempotency_key(idempotency_key, record.id)
 
         task = asyncio.create_task(self._run(record.id, provider, params))
         self._background_tasks.add(task)
@@ -245,33 +253,79 @@ class JobManager:
             headers[WEBHOOK_SIGNATURE_HEADER] = f"sha256={signature}"
 
         last_exc: Optional[Exception] = None
+        delays = (0.0, *_webhook_backoff_delays())
+        for attempt, delay in enumerate(delays, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                response = await client.post(
+                    record.webhook_url,
+                    content=body,
+                    headers=headers,
+                    timeout=WEBHOOK_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                await self._record_webhook_outcome(record.id, "delivered")
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                logger.debug(
+                    "webhook delivery attempt %d to %s failed: %s",
+                    attempt,
+                    record.webhook_url,
+                    exc,
+                )
+        logger.warning(
+            "webhook delivery to %s gave up after %d attempts for job %s: %s",
+            record.webhook_url,
+            len(delays),
+            record.id,
+            last_exc,
+        )
+        # The dead letter: without this, an exhausted delivery was a log
+        # line and nothing else -- no way to see through the API which jobs
+        # never reached their receiver.
+        await self._record_webhook_outcome(record.id, "failed")
+
+    async def _record_webhook_outcome(self, job_id: str, outcome: str) -> None:
         try:
-            for attempt, delay in enumerate((0.0, *WEBHOOK_RETRY_DELAYS), start=1):
-                if delay:
-                    await asyncio.sleep(delay)
-                try:
-                    response = await client.post(
-                        record.webhook_url,
-                        content=body,
-                        headers=headers,
-                        timeout=WEBHOOK_TIMEOUT_SECONDS,
-                    )
-                    response.raise_for_status()
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    last_exc = exc
-                    logger.debug(
-                        "webhook delivery attempt %d to %s failed: %s",
-                        attempt,
-                        record.webhook_url,
-                        exc,
-                    )
-            logger.warning(
-                "webhook delivery to %s gave up after %d attempts for job %s: %s",
-                record.webhook_url,
-                len(WEBHOOK_RETRY_DELAYS) + 1,
+            await self.store.set_webhook_status(job_id, outcome)
+        except Exception:  # noqa: BLE001 - bookkeeping about delivery must
+            # never take down the delivery task itself.
+            logger.exception("job %s: failed to record webhook outcome %r", job_id, outcome)
+
+    async def recover_interrupted_jobs(self) -> int:
+        """Fail interrupted jobs honestly at startup; returns how many.
+
+        Background tasks die with the process, so a job found ``pending`` or
+        ``processing`` when the server starts has, provably, nothing driving
+        it anymore -- left alone it would read "processing" forever, which
+        the audit demonstrated against a restarted SQLite-backed gateway.
+        Marking it ``error`` with an explicit resubmit message is the only
+        truthful recovery short of re-running the provider, which this
+        deliberately does not do: whether a half-finished generation's side
+        effects (billing, uploads) are safe to repeat is the caller's call
+        to make, and they signal it by resubmitting with a fresh
+        idempotency key (the original key keeps returning the errored
+        record, which is how the caller learns what happened). The webhook,
+        if any, fires for the error like any other terminal transition, so
+        receivers hear about it too.
+        """
+        recovered = 0
+        for record in await self.store.list():
+            if record.status not in (JobStatus.PENDING, JobStatus.PROCESSING):
+                continue
+            updated = await self.store.update_status(
                 record.id,
-                last_exc,
+                status=JobStatus.ERROR,
+                error=(
+                    "interrupted by a gateway restart before completing; "
+                    "submit the job again to re-run it"
+                ),
             )
-        finally:
-            pass  # the client is shared for the manager's lifetime; see aclose()
+            recovered += 1
+            if updated.webhook_url:
+                task = asyncio.create_task(self._deliver_webhook(updated))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+        return recovered

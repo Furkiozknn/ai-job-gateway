@@ -29,6 +29,14 @@ from typing import Optional
 from . import clock
 from .models import TERMINAL_STATUSES, JobRecord, JobStatus
 
+#: How many (idempotency_key -> job_id) pairs a store retains, oldest
+#: evicted first. Bounded so a client minting a fresh key per call forever
+#: can't grow storage without limit. Lives in the store (it used to be a
+#: dict inside JobManager) because dedupe that evaporates on restart is
+#: exactly when it's needed most: a deploy mid-request is the classic way
+#: a client's response gets lost and its retry double-runs the provider.
+MAX_IDEMPOTENCY_KEYS = 10_000
+
 
 def _expiry_message(record: JobRecord) -> str:
     assert record.result_expires_at is not None
@@ -86,6 +94,20 @@ class JobStore(ABC):
     async def list(self) -> list[JobRecord]:
         """Return all jobs (small reference store -- no pagination)."""
 
+    @abstractmethod
+    async def remember_idempotency_key(self, key: str, job_id: str) -> None:
+        """Record that ``key`` led to ``job_id``, evicting the oldest entry
+        beyond ``MAX_IDEMPOTENCY_KEYS``. Re-remembering a key overwrites."""
+
+    @abstractmethod
+    async def recall_idempotency_key(self, key: str) -> Optional[str]:
+        """The job id ``key`` previously led to, or None."""
+
+    @abstractmethod
+    async def set_webhook_status(self, job_id: str, webhook_status: str) -> None:
+        """Record webhook delivery outcome ("delivered"/"failed") without
+        touching the job's own status/result/error."""
+
 
 class InMemoryJobStore(JobStore):
     """Dict-backed store. Fine for a single-process reference server.
@@ -96,6 +118,7 @@ class InMemoryJobStore(JobStore):
 
     def __init__(self) -> None:
         self._jobs: dict[str, JobRecord] = {}
+        self._idempotency_keys: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
     async def create(self, record: JobRecord) -> None:
@@ -135,6 +158,25 @@ class InMemoryJobStore(JobStore):
             records = list(self._jobs.values())
         return [_apply_expiry(r) for r in records]
 
+    async def remember_idempotency_key(self, key: str, job_id: str) -> None:
+        async with self._lock:
+            self._idempotency_keys.pop(key, None)  # re-insert moves it to newest
+            if len(self._idempotency_keys) >= MAX_IDEMPOTENCY_KEYS:
+                self._idempotency_keys.pop(next(iter(self._idempotency_keys)))
+            self._idempotency_keys[key] = job_id
+
+    async def recall_idempotency_key(self, key: str) -> Optional[str]:
+        async with self._lock:
+            return self._idempotency_keys.get(key)
+
+    async def set_webhook_status(self, job_id: str, webhook_status: str) -> None:
+        async with self._lock:
+            current = self._jobs.get(job_id)
+            if current is not None:
+                self._jobs[job_id] = current.model_copy(
+                    update={"webhook_status": webhook_status, "updated_at": clock.now()}
+                )
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -148,7 +190,16 @@ CREATE TABLE IF NOT EXISTS jobs (
     result TEXT,
     error TEXT,
     result_expires_at TEXT,
-    webhook_url TEXT
+    webhook_url TEXT,
+    webhook_status TEXT
+)
+"""
+
+_IDEMPOTENCY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
 )
 """
 
@@ -170,6 +221,7 @@ def _row_to_record(row: sqlite3.Row) -> JobRecord:
             else None
         ),
         webhook_url=row["webhook_url"],
+        webhook_status=row["webhook_status"],
     )
 
 
@@ -202,38 +254,68 @@ class SQLiteJobStore(JobStore):
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(_SCHEMA)
+        self._conn.execute(_IDEMPOTENCY_SCHEMA)
+        # A database created before webhook_status existed lacks the column;
+        # CREATE TABLE IF NOT EXISTS never adds one.
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+        if "webhook_status" not in columns:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN webhook_status TEXT")
         self._conn.commit()
+        # From here on, transactions are explicit: every write runs inside
+        # BEGIN IMMEDIATE (see _write_txn), which takes the write lock at
+        # BEGIN time instead of at first write. Under a deferred
+        # transaction, two processes sharing this file can both start
+        # reading and then deadlock-abort ("database is locked" without
+        # consuming busy_timeout) when both try to upgrade to a write;
+        # IMMEDIATE makes the second writer queue on busy_timeout instead.
+        self._conn.isolation_level = None
 
     def close(self) -> None:
         self._conn.close()
+
+    def _write_txn(self, statements: list[tuple[str, tuple]]) -> None:
+        """Run statements inside one BEGIN IMMEDIATE transaction."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for sql, args in statements:
+                self._conn.execute(sql, args)
+        except BaseException:
+            self._conn.rollback()
+            raise
+        self._conn.commit()
 
     async def create(self, record: JobRecord) -> None:
         async with self._lock:
             await asyncio.to_thread(self._insert, record)
 
     def _insert(self, record: JobRecord) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO jobs (
-                id, capability, provider, params, status,
-                created_at, updated_at, result, error, result_expires_at, webhook_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                record.id,
-                record.capability,
-                record.provider,
-                json.dumps(record.params),
-                record.status.value,
-                record.created_at.isoformat(),
-                record.updated_at.isoformat(),
-                json.dumps(record.result) if record.result is not None else None,
-                record.error,
-                record.result_expires_at.isoformat() if record.result_expires_at else None,
-                record.webhook_url,
-            ),
+        self._write_txn(
+            [
+                (
+                    """
+                    INSERT INTO jobs (
+                        id, capability, provider, params, status,
+                        created_at, updated_at, result, error, result_expires_at,
+                        webhook_url, webhook_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.id,
+                        record.capability,
+                        record.provider,
+                        json.dumps(record.params),
+                        record.status.value,
+                        record.created_at.isoformat(),
+                        record.updated_at.isoformat(),
+                        json.dumps(record.result) if record.result is not None else None,
+                        record.error,
+                        record.result_expires_at.isoformat() if record.result_expires_at else None,
+                        record.webhook_url,
+                        record.webhook_status,
+                    ),
+                )
+            ]
         )
-        self._conn.commit()
 
     def _select_one(self, job_id: str) -> Optional[sqlite3.Row]:
         return self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -252,22 +334,25 @@ class SQLiteJobStore(JobStore):
         result_expires_at: Optional[datetime],
         updated_at: datetime,
     ) -> None:
-        self._conn.execute(
-            """
-            UPDATE jobs
-            SET status = ?, result = ?, error = ?, result_expires_at = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                status.value,
-                json.dumps(result) if result is not None else None,
-                error,
-                result_expires_at.isoformat() if result_expires_at else None,
-                updated_at.isoformat(),
-                job_id,
-            ),
+        self._write_txn(
+            [
+                (
+                    """
+                    UPDATE jobs
+                    SET status = ?, result = ?, error = ?, result_expires_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        status.value,
+                        json.dumps(result) if result is not None else None,
+                        error,
+                        result_expires_at.isoformat() if result_expires_at else None,
+                        updated_at.isoformat(),
+                        job_id,
+                    ),
+                )
+            ]
         )
-        self._conn.commit()
 
     async def update_status(
         self,
@@ -294,3 +379,53 @@ class SQLiteJobStore(JobStore):
         async with self._lock:
             rows = await asyncio.to_thread(self._select_all)
         return [_apply_expiry(_row_to_record(r)) for r in rows]
+
+    def _remember_key(self, key: str, job_id: str) -> None:
+        self._write_txn(
+            [
+                (
+                    "INSERT OR REPLACE INTO idempotency_keys (key, job_id, created_at) VALUES (?, ?, ?)",
+                    (key, job_id, clock.now().isoformat()),
+                ),
+                (
+                    # Evict oldest beyond the cap; rowid breaks created_at
+                    # ties so eviction order stays deterministic.
+                    """
+                    DELETE FROM idempotency_keys WHERE key IN (
+                        SELECT key FROM idempotency_keys
+                        ORDER BY created_at DESC, rowid DESC
+                        LIMIT -1 OFFSET ?
+                    )
+                    """,
+                    (MAX_IDEMPOTENCY_KEYS,),
+                ),
+            ]
+        )
+
+    async def remember_idempotency_key(self, key: str, job_id: str) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._remember_key, key, job_id)
+
+    def _recall_key(self, key: str) -> Optional[str]:
+        row = self._conn.execute(
+            "SELECT job_id FROM idempotency_keys WHERE key = ?", (key,)
+        ).fetchone()
+        return row["job_id"] if row is not None else None
+
+    async def recall_idempotency_key(self, key: str) -> Optional[str]:
+        async with self._lock:
+            return await asyncio.to_thread(self._recall_key, key)
+
+    def _set_webhook_status(self, job_id: str, webhook_status: str, updated_at: datetime) -> None:
+        self._write_txn(
+            [
+                (
+                    "UPDATE jobs SET webhook_status = ?, updated_at = ? WHERE id = ?",
+                    (webhook_status, updated_at.isoformat(), job_id),
+                )
+            ]
+        )
+
+    async def set_webhook_status(self, job_id: str, webhook_status: str) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._set_webhook_status, job_id, webhook_status, clock.now())

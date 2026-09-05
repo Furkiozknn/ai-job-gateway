@@ -21,6 +21,7 @@ import asyncio
 import hmac
 import ipaddress
 import json
+import logging
 import re
 import socket
 from typing import Optional, Any
@@ -171,6 +172,16 @@ def create_app(
             raise HTTPException(401, "missing or invalid API key")
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
+        # Startup recovery sweep: a job still pending/processing in a
+        # persistent store has no living task driving it (tasks died with
+        # the previous process) and would read "processing" forever. A
+        # fresh in-memory store makes this a no-op.
+        recovered = await manager.recover_interrupted_jobs()
+        if recovered:
+            logging.getLogger(__name__).warning(
+                "marked %d job(s) left pending/processing by a previous run as error",
+                recovered,
+            )
         try:
             yield
         finally:
