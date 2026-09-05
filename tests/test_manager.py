@@ -487,3 +487,121 @@ def test_webhook_backoff_is_capped_exponential_with_full_jitter():
     ]
     assert delays == expected
     assert all(low == 0.0 for low, _ in seen_bounds)  # full jitter: floor is zero
+
+
+# --- adversarial-review regressions: the two crash windows ---
+
+
+@pytest.mark.asyncio
+async def test_idempotency_key_is_remembered_before_the_record_exists(store):
+    """Ordering is the whole defense: if the record were created first, a
+    crash before the key landed would make the client's retry double-run
+    the provider. The key must be durable before the job is."""
+    order = []
+
+    class OrderSpyStore:
+        def __init__(self, inner):
+            self._inner = inner
+
+        async def create(self, record):
+            order.append("create")
+            await self._inner.create(record)
+
+        async def remember_idempotency_key(self, key, job_id):
+            order.append("remember")
+            await self._inner.remember_idempotency_key(key, job_id)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    manager = JobManager(OrderSpyStore(store), {"mock-generate": MockProvider(delay_seconds=0.01)})
+    await manager.submit("mock-generate", {}, idempotency_key="order-matters")
+    assert order == ["remember", "create"]
+
+
+@pytest.mark.asyncio
+async def test_crash_between_key_and_record_self_heals_without_a_double_run(store):
+    """Simulated crash: the key lands, record creation dies. The retry with
+    the same key must run the provider exactly once, not zero and not two."""
+    run_count = 0
+
+    class CountingProvider(MockProvider):
+        name = "counting"
+
+        async def run(self, job_id, params):
+            nonlocal run_count
+            run_count += 1
+            return await super().run(job_id, params)
+
+    class CrashOnceStore:
+        def __init__(self, inner):
+            self._inner = inner
+            self._armed = True
+
+        async def create(self, record):
+            if self._armed:
+                self._armed = False
+                raise RuntimeError("simulated crash after key, before record")
+            await self._inner.create(record)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    manager = JobManager(CrashOnceStore(store), {"counting": CountingProvider(delay_seconds=0.01)})
+    with pytest.raises(RuntimeError):
+        await manager.submit("counting", {}, idempotency_key="crashy")
+    # The dangling key points at a job that never existed; the retry must
+    # fall through to a fresh submission and re-point the key at it.
+    record = await manager.submit("counting", {}, idempotency_key="crashy")
+    final = await _wait_until_terminal(store, record.id)
+    assert final.status == JobStatus.READY
+    assert run_count == 1
+    assert await store.recall_idempotency_key("crashy") == record.id
+
+
+@pytest.mark.asyncio
+async def test_recovery_refires_webhooks_with_no_recorded_outcome(store):
+    """A job that finished right before a crash, webhook outcome never
+    recorded: the receiver may never have heard. The startup sweep re-fires
+    it (at-least-once) and leaves already-delivered jobs alone."""
+    from datetime import timedelta as _td
+
+    from ai_job_gateway.models import JobRecord
+
+    calls = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    manager = JobManager(store, {}, http_client=http_client)
+
+    now = clock.now()
+    far = now + _td(hours=1)
+    unheard = JobRecord(
+        id="unheard", capability="c", provider="p", params={}, status=JobStatus.READY,
+        created_at=now, updated_at=now, result_expires_at=far,
+        webhook_url="https://example.test/unheard",
+    )
+    heard = JobRecord(
+        id="heard", capability="c", provider="p", params={}, status=JobStatus.READY,
+        created_at=now, updated_at=now, result_expires_at=far,
+        webhook_url="https://example.test/heard", webhook_status="delivered",
+    )
+    await store.create(unheard)
+    await store.create(heard)
+
+    recovered = await manager.recover_interrupted_jobs()
+    assert recovered == 0  # nothing was pending/processing
+    for _ in range(100):
+        if calls:
+            break
+        await asyncio.sleep(0.01)
+    assert calls == ["https://example.test/unheard"]
+    for _ in range(100):
+        fetched = await store.get("unheard")
+        if fetched.webhook_status is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert fetched.webhook_status == "delivered"

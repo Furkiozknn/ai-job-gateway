@@ -29,7 +29,7 @@ import httpx
 
 from . import clock
 from .exceptions import UnknownCapabilityError
-from .models import JobRecord, JobStatus
+from .models import TERMINAL_STATUSES, JobRecord, JobStatus
 from .providers import Provider
 from .store import JobStore
 
@@ -168,15 +168,22 @@ class JobManager:
             updated_at=now,
             webhook_url=webhook_url,
         )
-        await self.store.create(record)
-
         if idempotency_key is not None:
             # Persisted in the store (not a manager-local dict, as it used
             # to be): dedupe that evaporates on restart fails exactly when
             # it's needed most -- a deploy mid-request is the classic way a
             # response gets lost and the client's retry double-runs the
             # provider. Demonstrated live in the ecosystem audit.
+            #
+            # Remembered BEFORE the record is created, deliberately: a crash
+            # between the two calls then leaves a key pointing at a job that
+            # doesn't exist, which the recall path above already treats as a
+            # fresh submission (and re-remembers) -- a self-healing no-op.
+            # The other order left the opposite window: record created, key
+            # not yet remembered, so the client's retry double-ran the
+            # provider -- the exact failure this feature exists to prevent.
             await self.store.remember_idempotency_key(idempotency_key, record.id)
+        await self.store.create(record)
 
         task = asyncio.create_task(self._run(record.id, provider, params))
         self._background_tasks.add(task)
@@ -310,9 +317,37 @@ class JobManager:
         record, which is how the caller learns what happened). The webhook,
         if any, fires for the error like any other terminal transition, so
         receivers hear about it too.
+
+        Also re-fires webhooks for jobs that finished but whose delivery
+        outcome was never recorded (terminal status, webhook_url set,
+        webhook_status still None) - the previous process died mid-delivery
+        and the receiver may never have heard. At-least-once, deliberately;
+        these do not count toward the returned number.
+
+        Single-process assumption, stated plainly: this sweep treats every
+        pending/processing row as ownerless. Run two gateway processes over
+        one SQLite file and the second one's startup will fail the first
+        one's live jobs. Multi-process deployments need a store with real
+        ownership (see README limitations).
         """
         recovered = 0
         for record in await self.store.list():
+            if (
+                record.status in TERMINAL_STATUSES
+                and record.webhook_url
+                and record.webhook_status is None
+            ):
+                # A terminal job with no recorded delivery outcome means the
+                # previous process died between finishing the job and
+                # finishing (or recording) its webhook -- the receiver may
+                # never have heard. Re-fire it: at-least-once, on purpose.
+                # If the crash landed after a 2xx but before the outcome was
+                # recorded, the receiver sees a duplicate, which is the
+                # standard webhook contract (receivers dedupe on job id).
+                task = asyncio.create_task(self._deliver_webhook(record))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                continue
             if record.status not in (JobStatus.PENDING, JobStatus.PROCESSING):
                 continue
             updated = await self.store.update_status(
