@@ -252,10 +252,10 @@ def create_app(
         capability. Expired jobs are listed with status "expired" (their
         result is gone; the record is not).
 
-        Filtering and the limit are applied in memory on top of
-        ``JobStore.list()``, which is the honest shape for a reference store
-        that documents itself as unpaginated; a real deployment's store would
-        push both into the query.
+        Filtering, sorting and the limit live in ``JobStore.list_page`` --
+        pushed into SQL by the SQLite store -- so one dashboard polling this
+        endpoint no longer scans (or holds the store lock across) every row
+        ever created.
         """
         _require_api_key(request)
         wanted_status: Optional[JobStatus] = None
@@ -269,34 +269,29 @@ def create_app(
         if capability is not None and not _CAPABILITY_NAME_RE.match(capability):
             raise HTTPException(422, "capability filter contains characters no capability can have")
 
-        records = await manager.store.list()
-        if wanted_status is not None:
-            records = [r for r in records if r.status == wanted_status]
-        if capability is not None:
-            records = [r for r in records if r.capability == capability]
-        records.sort(key=lambda r: r.created_at, reverse=True)
-        page = records[:limit]
+        page, total_matching = await manager.store.list_page(
+            status=wanted_status, capability=capability, limit=limit
+        )
         return {
             "jobs": [r.model_dump(mode="json") for r in page],
             "count": len(page),
-            "total_matching": len(records),
+            "total_matching": total_matching,
         }
 
     @app.get("/v1/stats")
     async def stats(request: Request) -> dict[str, Any]:
         _require_api_key(request)
         """Counts by status and by capability - what an operator glances at
-        to see whether the queue is draining or a provider is failing."""
-        records = await manager.store.list()
+        to see whether the queue is draining or a provider is failing.
+        Computed by ``JobStore.stats`` (one aggregate query in the SQLite
+        store) rather than by materializing every record here."""
+        counts = await manager.store.stats()
         by_status = {s.value: 0 for s in JobStatus}
-        by_capability: dict[str, int] = {}
-        for record in records:
-            by_status[record.status.value] = by_status.get(record.status.value, 0) + 1
-            by_capability[record.capability] = by_capability.get(record.capability, 0) + 1
+        by_status.update(counts["by_status"])
         return {
-            "total": len(records),
+            "total": counts["total"],
             "by_status": by_status,
-            "by_capability": dict(sorted(by_capability.items())),
+            "by_capability": dict(sorted(counts["by_capability"].items())),
             "registered_capabilities": len(manager.registry),
         }
 

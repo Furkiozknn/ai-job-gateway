@@ -22,8 +22,15 @@ def _serve(args: argparse.Namespace) -> None:
     from .server import create_app
     from .store import InMemoryJobStore, SQLiteJobStore
 
+    from datetime import timedelta
+
     store = SQLiteJobStore(args.db) if args.db else InMemoryJobStore()
-    manager = JobManager(store, default_registry())
+    manager = JobManager(
+        store,
+        default_registry(),
+        job_timeout=timedelta(seconds=args.job_timeout) if args.job_timeout > 0 else None,
+        max_concurrent_jobs=args.max_concurrent_jobs if args.max_concurrent_jobs > 0 else None,
+    )
     # The API key comes from the environment, never an argv flag: process
     # listings and shell history are not places for a credential.
     app = create_app(
@@ -76,6 +83,25 @@ def main() -> None:
         "--db",
         default=None,
         help="path to a SQLite file for job persistence (default: in-memory, lost on restart)",
+    )
+    serve_parser.add_argument(
+        "--job-timeout",
+        type=float,
+        default=600.0,
+        help=(
+            "seconds one provider run may take before the job is failed with an "
+            "honest error instead of sitting 'processing' forever (0 disables; "
+            "default: 600)"
+        ),
+    )
+    serve_parser.add_argument(
+        "--max-concurrent-jobs",
+        type=int,
+        default=100,
+        help=(
+            "how many provider runs may execute at once; jobs beyond the cap "
+            "queue as 'pending' (0 removes the cap; default: 100)"
+        ),
     )
     serve_parser.set_defaults(func=_serve)
 

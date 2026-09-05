@@ -94,6 +94,46 @@ class JobStore(ABC):
     async def list(self) -> list[JobRecord]:
         """Return all jobs (small reference store -- no pagination)."""
 
+    async def list_page(
+        self,
+        *,
+        status: Optional[JobStatus] = None,
+        capability: Optional[str] = None,
+        limit: int = 50,
+    ) -> tuple[list[JobRecord], int]:
+        """A newest-first page of jobs plus the total number matching.
+
+        Filters compare against the *displayed* status -- the one a caller
+        sees after expiry is applied -- so ``status=ready`` never returns a
+        job whose result window has already passed, and ``status=expired``
+        finds exactly those jobs. This default implementation scans
+        ``list()``; ``SQLiteJobStore`` overrides it to push the filter,
+        sort and limit into SQL so one dashboard poll doesn't pay for (or
+        hold locks across) every row ever stored.
+        """
+        records = await self.list()
+        if status is not None:
+            records = [r for r in records if r.status == status]
+        if capability is not None:
+            records = [r for r in records if r.capability == capability]
+        records.sort(key=lambda r: r.created_at, reverse=True)
+        return records[:limit], len(records)
+
+    async def stats(self) -> dict:
+        """Counts by displayed status and by capability, plus the total.
+
+        Returns ``{"total": int, "by_status": {...}, "by_capability": {...}}``.
+        Like ``list_page``, the default scans ``list()`` and the SQLite
+        store overrides it with one aggregate query.
+        """
+        records = await self.list()
+        by_status: dict[str, int] = {}
+        by_capability: dict[str, int] = {}
+        for record in records:
+            by_status[record.status.value] = by_status.get(record.status.value, 0) + 1
+            by_capability[record.capability] = by_capability.get(record.capability, 0) + 1
+        return {"total": len(records), "by_status": by_status, "by_capability": by_capability}
+
     @abstractmethod
     async def remember_idempotency_key(self, key: str, job_id: str) -> None:
         """Record that ``key`` led to ``job_id``, evicting the oldest entry
@@ -260,6 +300,18 @@ class SQLiteJobStore(JobStore):
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
         if "webhook_status" not in columns:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN webhook_status TEXT")
+        # Indexes for the hot paths the audit measured: newest-first paging
+        # (list_page), status-filtered listings, and the idempotency-key
+        # eviction sort, which otherwise re-sorts the whole key table on
+        # every remembered key once the cap is reached.
+        self._conn.execute("CREATE INDEX IF NOT EXISTS ix_jobs_created_at ON jobs(created_at)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_jobs_status_created_at ON jobs(status, created_at)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_idempotency_keys_created_at "
+            "ON idempotency_keys(created_at)"
+        )
         self._conn.commit()
         # From here on, transactions are explicit: every write runs inside
         # BEGIN IMMEDIATE (see _write_txn), which takes the write lock at
@@ -379,6 +431,69 @@ class SQLiteJobStore(JobStore):
         async with self._lock:
             rows = await asyncio.to_thread(self._select_all)
         return [_apply_expiry(_row_to_record(r)) for r in rows]
+
+    #: The status a caller actually observes: a terminal row whose result
+    #: window has passed reads as 'expired' even though nothing rewrites the
+    #: stored status (expiry is a pure function of now -- see module
+    #: docstring). Any SQL that filters or groups by status must use this
+    #: expression, not the raw column, or a ready-but-expired job would leak
+    #: into a status=ready listing. The placeholder is "now" as an isoformat
+    #: string; stored timestamps come from the same clock, so lexicographic
+    #: comparison is chronological.
+    _DISPLAY_STATUS_SQL = (
+        "CASE WHEN status IN ('ready', 'error') "
+        "AND result_expires_at IS NOT NULL AND result_expires_at <= ? "
+        "THEN 'expired' ELSE status END"
+    )
+
+    def _select_page(
+        self, status: Optional[str], capability: Optional[str], limit: int, now_iso: str
+    ) -> tuple[list[sqlite3.Row], int]:
+        where = f"WHERE (? IS NULL OR {self._DISPLAY_STATUS_SQL} = ?) AND (? IS NULL OR capability = ?)"
+        filter_args = (status, now_iso, status, capability, capability)
+        rows = self._conn.execute(
+            f"SELECT * FROM jobs {where} ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (*filter_args, limit),
+        ).fetchall()
+        total = self._conn.execute(
+            f"SELECT COUNT(*) FROM jobs {where}", filter_args
+        ).fetchone()[0]
+        return rows, total
+
+    async def list_page(
+        self,
+        *,
+        status: Optional[JobStatus] = None,
+        capability: Optional[str] = None,
+        limit: int = 50,
+    ) -> tuple[list[JobRecord], int]:
+        now_iso = clock.now().isoformat()
+        wanted = status.value if status is not None else None
+        async with self._lock:
+            rows, total = await asyncio.to_thread(
+                self._select_page, wanted, capability, limit, now_iso
+            )
+        return [_apply_expiry(_row_to_record(r)) for r in rows], total
+
+    def _select_stats(self, now_iso: str) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            f"SELECT {self._DISPLAY_STATUS_SQL} AS status, capability, COUNT(*) AS n "
+            "FROM jobs GROUP BY 1, 2",
+            (now_iso,),
+        ).fetchall()
+
+    async def stats(self) -> dict:
+        now_iso = clock.now().isoformat()
+        async with self._lock:
+            rows = await asyncio.to_thread(self._select_stats, now_iso)
+        by_status: dict[str, int] = {}
+        by_capability: dict[str, int] = {}
+        total = 0
+        for row in rows:
+            by_status[row["status"]] = by_status.get(row["status"], 0) + row["n"]
+            by_capability[row["capability"]] = by_capability.get(row["capability"], 0) + row["n"]
+            total += row["n"]
+        return {"total": total, "by_status": by_status, "by_capability": by_capability}
 
     def _remember_key(self, key: str, job_id: str) -> None:
         self._write_txn(
