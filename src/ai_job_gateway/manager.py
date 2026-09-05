@@ -88,6 +88,8 @@ class JobManager:
         result_ttl: timedelta = DEFAULT_RESULT_TTL,
         http_client: Optional[httpx.AsyncClient] = None,
         webhook_signing_secret: Optional[str] = None,
+        job_timeout: Optional[timedelta] = None,
+        max_concurrent_jobs: Optional[int] = None,
     ) -> None:
         self.store = store
         self.registry = registry
@@ -95,6 +97,28 @@ class JobManager:
         self._http_client = http_client
         self._owns_http_client = http_client is None
         self._webhook_signing_secret = webhook_signing_secret
+        #: How long one provider.run() may take before the job is failed
+        #: honestly. None (the library default) preserves the historical
+        #: behavior -- but note that without it a provider that never
+        #: returns leaves its job "processing" until the next restart
+        #: sweep; the CLI serves with a real default for exactly that
+        #: reason.
+        self.job_timeout = job_timeout
+        #: Cap on provider calls running at once. A job admitted beyond the
+        #: cap stays honestly "pending" until a slot frees up. None means
+        #: unbounded (the historical behavior).
+        self._job_slots = (
+            asyncio.Semaphore(max_concurrent_jobs) if max_concurrent_jobs else None
+        )
+        # Per-idempotency-key serialization for submit(). The store's
+        # recall -> remember -> create sequence yields to the event loop
+        # between calls (every SQLite call is an awaited to_thread), so two
+        # concurrent submissions with the same key could both see "no such
+        # key" and both run the provider -- the exact double-run the
+        # feature exists to prevent, demonstrated live in the audit.
+        # Serializing per key (never globally) closes it for every store.
+        self._submit_key_locks: dict[str, asyncio.Lock] = {}
+        self._submit_key_waiters: dict[str, int] = {}
         # Keeps a strong reference to in-flight background tasks -- asyncio
         # only weakly holds tasks created with create_task, so without this a
         # task can be garbage-collected mid-run.
@@ -147,16 +171,69 @@ class JobManager:
         if provider is None:
             raise UnknownCapabilityError(capability)
 
-        if idempotency_key is not None:
-            existing_id = await self.store.recall_idempotency_key(idempotency_key)
-            if existing_id is not None:
-                existing = await self.store.get(existing_id)
-                if existing is not None:
-                    return existing
-                # The original record is gone (e.g. evicted from an
-                # in-memory store some other way) -- fall through and treat
-                # this as a fresh submission rather than erroring.
+        if idempotency_key is None:
+            record = self._new_record(capability, provider, params, webhook_url)
+            await self.store.create(record)
+            self._schedule(record, provider, params)
+            return record
 
+        # Serialize per key: two concurrent retries carrying the same key
+        # must resolve to one job and one provider run. Without this, both
+        # could pass recall() before either reaches remember() -- every
+        # store call yields to the event loop, so this is reachable in a
+        # single process (demonstrated in the audit against the SQLite
+        # store). The lock table is cleaned up by waiter-count so a stream
+        # of unique keys can't grow it without bound.
+        lock = self._submit_key_locks.get(idempotency_key)
+        if lock is None:
+            lock = self._submit_key_locks[idempotency_key] = asyncio.Lock()
+        self._submit_key_waiters[idempotency_key] = (
+            self._submit_key_waiters.get(idempotency_key, 0) + 1
+        )
+        try:
+            async with lock:
+                existing_id = await self.store.recall_idempotency_key(idempotency_key)
+                if existing_id is not None:
+                    existing = await self.store.get(existing_id)
+                    if existing is not None:
+                        return existing
+                    # The original record is gone (e.g. evicted from an
+                    # in-memory store some other way) -- fall through and
+                    # treat this as a fresh submission rather than erroring.
+                # Persisted in the store (not a manager-local dict, as it
+                # used to be): dedupe that evaporates on restart fails
+                # exactly when it's needed most -- a deploy mid-request is
+                # the classic way a response gets lost and the client's
+                # retry double-runs the provider.
+                #
+                # Remembered BEFORE the record is created, deliberately: a
+                # crash between the two calls then leaves a key pointing at
+                # a job that doesn't exist, which the recall path above
+                # already treats as a fresh submission (and re-remembers)
+                # -- a self-healing no-op. The other order left the
+                # opposite window: record created, key not yet remembered,
+                # so the client's retry double-ran the provider -- the
+                # exact failure this feature exists to prevent.
+                record = self._new_record(capability, provider, params, webhook_url)
+                await self.store.remember_idempotency_key(idempotency_key, record.id)
+                await self.store.create(record)
+                self._schedule(record, provider, params)
+                return record
+        finally:
+            remaining = self._submit_key_waiters[idempotency_key] - 1
+            if remaining:
+                self._submit_key_waiters[idempotency_key] = remaining
+            else:
+                del self._submit_key_waiters[idempotency_key]
+                del self._submit_key_locks[idempotency_key]
+
+    def _new_record(
+        self,
+        capability: str,
+        provider: Provider,
+        params: dict,
+        webhook_url: Optional[str],
+    ) -> JobRecord:
         now = clock.now()
         record = JobRecord(
             id=uuid.uuid4().hex,
@@ -168,47 +245,23 @@ class JobManager:
             updated_at=now,
             webhook_url=webhook_url,
         )
-        if idempotency_key is not None:
-            # Persisted in the store (not a manager-local dict, as it used
-            # to be): dedupe that evaporates on restart fails exactly when
-            # it's needed most -- a deploy mid-request is the classic way a
-            # response gets lost and the client's retry double-runs the
-            # provider. Demonstrated live in the ecosystem audit.
-            #
-            # Remembered BEFORE the record is created, deliberately: a crash
-            # between the two calls then leaves a key pointing at a job that
-            # doesn't exist, which the recall path above already treats as a
-            # fresh submission (and re-remembers) -- a self-healing no-op.
-            # The other order left the opposite window: record created, key
-            # not yet remembered, so the client's retry double-ran the
-            # provider -- the exact failure this feature exists to prevent.
-            await self.store.remember_idempotency_key(idempotency_key, record.id)
-        await self.store.create(record)
+        return record
 
+    def _schedule(self, record: JobRecord, provider: Provider, params: dict) -> None:
         task = asyncio.create_task(self._run(record.id, provider, params))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
-        return record
 
     async def _run(self, job_id: str, provider: Provider, params: dict) -> None:
         try:
-            await self.store.update_status(job_id, status=JobStatus.PROCESSING)
-            try:
-                result = await provider.run(job_id, params)
-            except Exception as exc:  # noqa: BLE001 - deliberately broad: any
-                # provider failure becomes a reported error, never an unhandled
-                # exception that would silently kill the background task.
-                record = await self.store.update_status(
-                    job_id, status=JobStatus.ERROR, error=str(exc)
-                )
+            if self._job_slots is not None:
+                # The job stays honestly "pending" while it queues for a
+                # slot; "processing" is only ever written once the provider
+                # is actually about to run.
+                async with self._job_slots:
+                    record = await self._execute(job_id, provider, params)
             else:
-                expires_at = clock.now() + self.result_ttl
-                record = await self.store.update_status(
-                    job_id,
-                    status=JobStatus.READY,
-                    result=result,
-                    result_expires_at=expires_at,
-                )
+                record = await self._execute(job_id, provider, params)
         except Exception:  # noqa: BLE001 - deliberately broad: a failure in
             # the *store* itself (e.g. the update_status(PROCESSING) call
             # above, or the update_status(ERROR) call in the inner except
@@ -225,7 +278,10 @@ class JobManager:
             )
             try:
                 record = await self.store.update_status(
-                    job_id, status=JobStatus.ERROR, error="internal error while running job"
+                    job_id,
+                    status=JobStatus.ERROR,
+                    error="internal error while running job",
+                    result_expires_at=clock.now() + self.result_ttl,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
@@ -235,6 +291,51 @@ class JobManager:
                 )
                 return
         await self._deliver_webhook(record)
+
+    async def _execute(self, job_id: str, provider: Provider, params: dict) -> JobRecord:
+        """Run the provider and record the terminal status; returns the record.
+
+        Error records carry a ``result_expires_at`` just like ready ones do:
+        before they did, an errored job was the one kind of record that
+        never even reached ``expired``, so a store accumulated them forever
+        with nothing marking them as stale (audit finding).
+        """
+        await self.store.update_status(job_id, status=JobStatus.PROCESSING)
+        try:
+            if self.job_timeout is not None:
+                result = await asyncio.wait_for(
+                    provider.run(job_id, params), timeout=self.job_timeout.total_seconds()
+                )
+            else:
+                result = await provider.run(job_id, params)
+        except TimeoutError:
+            # Without a timeout, a provider that never returns leaves its
+            # job "processing" until the next restart's recovery sweep --
+            # invisible to the caller until then.
+            return await self.store.update_status(
+                job_id,
+                status=JobStatus.ERROR,
+                error=(
+                    f"provider did not finish within {self.job_timeout.total_seconds():g}s "
+                    "and was cancelled; submit again to retry"
+                ),
+                result_expires_at=clock.now() + self.result_ttl,
+            )
+        except Exception as exc:  # noqa: BLE001 - deliberately broad: any
+            # provider failure becomes a reported error, never an unhandled
+            # exception that would silently kill the background task.
+            return await self.store.update_status(
+                job_id,
+                status=JobStatus.ERROR,
+                error=str(exc),
+                result_expires_at=clock.now() + self.result_ttl,
+            )
+        return await self.store.update_status(
+            job_id,
+            status=JobStatus.READY,
+            result=result,
+            result_expires_at=clock.now() + self.result_ttl,
+        )
 
     async def _deliver_webhook(self, record: JobRecord) -> None:
         """POST the finished record to record.webhook_url, if set.
@@ -357,6 +458,7 @@ class JobManager:
                     "interrupted by a gateway restart before completing; "
                     "submit the job again to re-run it"
                 ),
+                result_expires_at=clock.now() + self.result_ttl,
             )
             recovered += 1
             if updated.webhook_url:

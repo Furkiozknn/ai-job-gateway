@@ -117,6 +117,12 @@ uv run ai-job-gateway serve
 uv run ai-job-gateway serve --db jobs.db
 ```
 
+Two guardrails are on by default and tunable: `--job-timeout` (600 s) fails
+a provider run that never returns with an honest error instead of leaving
+the job "processing" until the next restart, and `--max-concurrent-jobs`
+(100) caps how many provider runs execute at once — jobs beyond the cap
+queue as "pending". Pass `0` to disable either.
+
 Then, from another terminal:
 
 ```bash
@@ -210,14 +216,14 @@ This is a reference implementation exposed to whatever calls it, so it's worth b
 - **Optional API key.** Set `AJG_API_KEY` in the server's environment (it is deliberately not a CLI flag — argv leaks into process listings) and every `/v1/*` route requires `Authorization: Bearer <key>`, compared constant-time; `/health` stays open as a liveness probe. The bundled client speaks it too: `JobGatewayClient(url, api_key=...)` sends the header on every request, and `ai-job-gateway submit` reads the same `AJG_API_KEY` from its environment. Unset keeps the historical open behavior, which is acceptable only on the default `127.0.0.1` bind — without a key, anyone who can reach the port can submit compute and read every job's params and results.
 - **Capability names are constrained** to 1–100 characters of `[A-Za-z0-9_-]`, rejected with `422` otherwise, so a malformed path segment fails fast and legibly rather than becoming an opaque "unknown capability" or an odd log line.
 - **Webhook deliveries can be signed** (HMAC-SHA256, opt-in via `webhook_signing_secret`) so a receiver can verify a delivery genuinely came from this gateway and wasn't forged or tampered with — see [Webhooks](#webhooks) above.
-- **Still absent:** authentication and rate limiting. Anyone who can reach this server can submit jobs and read any job's result by id (job ids are unguessable UUIDs, but there's no ownership check). A public deployment needs API keys and per-key quotas before this is safe to expose — see the roadmap below.
+- **Still absent:** rate limiting and per-key ownership. Authentication exists (the `AJG_API_KEY` bearer key above), but it is one shared key: any holder can submit jobs and read any job's result by id (job ids are unguessable UUIDs, but there's no ownership check), and nothing limits how fast. A public deployment needs per-key identities and quotas before this is safe to expose — see the roadmap below.
 
 ## Roadmap — what a production deployment would add
 
 This is a reference implementation; it's honest about what it isn't:
 
 - **Real job queue.** The in-process `asyncio.create_task` model is fine for one server process. Real traffic needs a real queue (Redis/RQ, Celery, or dispatching to serverless GPU workers) so job execution survives a server restart and scales past one machine.
-- **Auth & rate limiting.** There is none. A public deployment needs API keys and per-key quotas before this is safe to expose.
+- **Per-key auth & rate limiting.** A single shared `AJG_API_KEY` exists; per-caller identities, ownership checks and quotas do not. A public deployment needs those before this is safe to expose.
 - **Real providers.** `EchoProvider`/`MockProvider` prove the contract; a real deployment implements `Provider` for actual backends (FLUX, Wan2.2, MuseTalk, whatever).
 - **Multi-worker/multi-process coordination.** `InMemoryJobStore` doesn't share state across processes; `SQLiteJobStore` survives a restart and takes its write locks eagerly (`BEGIN IMMEDIATE`, so a second process queues on `busy_timeout` instead of deadlock-aborting), but SQLite is still a single-writer database. A real deployment at that scale wants Postgres (or similar) behind the same `JobStore` interface.
 - **DNS-rebinding-proof webhook delivery.** See Security notes above — submission-time resolution is checked; pinning resolution at delivery time is left to deployments that need it.
