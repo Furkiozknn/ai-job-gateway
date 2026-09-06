@@ -402,3 +402,67 @@ async def test_recovery_candidates_match_a_full_scan_exactly(store_kind, tmp_pat
     assert got == expected
     assert "expired-unheard" in got, "an expired-but-unheard webhook is still re-fired"
     assert "ready-delivered" not in got and "ready-no-hook" not in got
+
+
+@pytest.mark.asyncio
+async def test_aclose_lets_an_in_flight_webhook_finish():
+    """Shutdown used to close the client out from under a delivery already
+    on the wire, losing it invisibly: the job's own status is correct either
+    way, so nothing recorded that the receiver never heard.
+    """
+    store = InMemoryJobStore()
+    await store.create(
+        JobRecord(
+            id="mid-flight", capability="echo", provider="mock", params={},
+            status=JobStatus.READY, created_at=clock.now(), updated_at=clock.now(),
+            result={}, webhook_url="https://receiver.example/slow",
+        )
+    )
+
+    async def handler(request):
+        # Still in flight when aclose() is called below.
+        await asyncio.sleep(0.2)
+        return httpx.Response(200)
+
+    manager = JobManager(
+        store,
+        {"echo": MockProvider()},
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    await manager.recover_interrupted_jobs()
+    await asyncio.sleep(0)  # let the delivery task actually start
+    await manager.aclose()
+
+    assert (await store.get("mid-flight")).webhook_status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_aclose_does_not_hang_on_work_that_outlives_the_grace_period():
+    """The drain is bounded on purpose: a webhook backing off can take ~65s
+    and a provider run far longer, and shutdown must not wait for either.
+    """
+    store = InMemoryJobStore()
+    await store.create(
+        JobRecord(
+            id="too-slow", capability="echo", provider="mock", params={},
+            status=JobStatus.READY, created_at=clock.now(), updated_at=clock.now(),
+            result={}, webhook_url="https://receiver.example/forever",
+        )
+    )
+
+    async def handler(request):
+        await asyncio.sleep(30)
+        return httpx.Response(200)
+
+    manager = JobManager(
+        store,
+        {"echo": MockProvider()},
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    await manager.recover_interrupted_jobs()
+    await asyncio.sleep(0)
+    started = asyncio.get_event_loop().time()
+    await manager.aclose(drain_timeout=0.1)
+    elapsed = asyncio.get_event_loop().time() - started
+
+    assert elapsed < 5.0, f"aclose waited {elapsed:.1f}s on work it should abandon"

@@ -131,6 +131,12 @@ recovers many unheard deliveries sends them in waves rather than firing
 every one at the same instant at a receiver that is often recovering from
 the same outage. Pass `0` to disable any of them.
 
+On shutdown the server gives work already in flight a bounded moment to
+finish (10 s) before closing the webhook client, so a delivery that was
+mid-request when the process was asked to stop still lands. Anything still
+running when that grace period ends is abandoned and logged — shutdown
+never waits out a full retry chain.
+
 Then, from another terminal:
 
 ```bash

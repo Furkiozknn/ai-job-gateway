@@ -65,6 +65,14 @@ WEBHOOK_TIMEOUT_SECONDS = 10.0
 #: sleep, so a webhook waiting out its backoff does not occupy a slot.
 DEFAULT_WEBHOOK_CONCURRENCY = 10
 
+#: How long aclose() gives in-flight background work to finish before it
+#: stops waiting. Long enough for one webhook attempt (WEBHOOK_TIMEOUT_SECONDS)
+#: to land, short enough that shutdown never hangs on a full retry chain or a
+#: long provider run. Whatever is still running past this is abandoned -- the
+#: historical behaviour for everything -- but it is now logged rather than
+#: silent.
+DEFAULT_SHUTDOWN_DRAIN_SECONDS = 10.0
+
 WEBHOOK_MAX_ATTEMPTS = 5
 WEBHOOK_BACKOFF_BASE_SECONDS = 1.0
 WEBHOOK_BACKOFF_CAP_SECONDS = 30.0
@@ -152,10 +160,39 @@ class JobManager:
             self._http_client = httpx.AsyncClient()
         return self._http_client
 
-    async def aclose(self) -> None:
-        """Close the webhook client this manager created. A client that was
-        injected belongs to whoever injected it and is left alone. The app
-        factory registers this as a shutdown handler."""
+    async def aclose(
+        self, *, drain_timeout: float = DEFAULT_SHUTDOWN_DRAIN_SECONDS
+    ) -> None:
+        """Let in-flight background work finish, then close the webhook client.
+
+        A client that was injected belongs to whoever injected it and is
+        left alone. The app factory registers this as a shutdown handler.
+
+        The drain is the point. Closing the client out from under a webhook
+        POST that is already on the wire loses a delivery the receiver was
+        about to get -- and loses it *invisibly*: the job's own status is
+        already correct, so nothing about the record says the notification
+        never arrived. Waiting a bounded moment first turns the common case
+        (a delivery mid-flight when the process is asked to stop) into a
+        completed one.
+
+        Bounded, because shutdown must not hang: a webhook backing off can
+        take ~65s and a provider run far longer. Anything still running when
+        the grace period ends is abandoned exactly as it was before this
+        drain existed -- but it is logged now, so a lost delivery leaves a
+        trace instead of nothing. Pass ``drain_timeout=0`` to skip waiting.
+        """
+        pending = {task for task in self._background_tasks if not task.done()}
+        if pending and drain_timeout > 0:
+            _, still_running = await asyncio.wait(pending, timeout=drain_timeout)
+            if still_running:
+                logger.warning(
+                    "shutting down with %d background task(s) still running after "
+                    "%.1fs; any webhook delivery among them is lost without being "
+                    "recorded as failed",
+                    len(still_running),
+                    drain_timeout,
+                )
         if self._owns_http_client and self._http_client is not None:
             await self._http_client.aclose()
             self._http_client = None
