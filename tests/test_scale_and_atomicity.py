@@ -341,3 +341,64 @@ async def test_webhook_concurrency_is_capped_by_default():
         assert DEFAULT_WEBHOOK_CONCURRENCY > 0
     finally:
         await manager.aclose()
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.asyncio
+async def test_recovery_candidates_match_a_full_scan_exactly(store_kind, tmp_path):
+    """The startup sweep no longer materialises every row ever stored, and
+    the narrowed query must decide identically to the scan it replaced.
+
+    The rows below cover each branch the sweep can take, including the two
+    that make the predicate subtle: a ready job past its result window
+    (displays 'expired', still has an unheard webhook, and is still re-fired
+    today) and a terminal job whose delivery outcome was already recorded
+    (skipped, and must not come back).
+    """
+    store = (
+        InMemoryJobStore()
+        if store_kind == "memory"
+        else SQLiteJobStore(str(tmp_path / "recovery.db"))
+    )
+    now = clock.now()
+
+    def rec(job_id, status, *, webhook=None, webhook_status=None, expires=None):
+        return JobRecord(
+            id=job_id, capability="cap", provider="p", params={}, status=status,
+            created_at=now, updated_at=now, webhook_url=webhook,
+            webhook_status=webhook_status, result_expires_at=expires,
+        )
+
+    rows = [
+        rec("pending-no-hook", JobStatus.PENDING),
+        rec("processing-with-hook", JobStatus.PROCESSING, webhook="https://e/1"),
+        rec("ready-unheard", JobStatus.READY, webhook="https://e/2",
+            expires=now + timedelta(hours=1)),
+        rec("error-unheard", JobStatus.ERROR, webhook="https://e/3"),
+        # Terminal, unheard, and already past its window: displays as
+        # 'expired' yet must still be a candidate.
+        rec("expired-unheard", JobStatus.READY, webhook="https://e/4",
+            expires=now - timedelta(hours=1)),
+        # Deliberately not candidates.
+        rec("ready-delivered", JobStatus.READY, webhook="https://e/5",
+            webhook_status="delivered"),
+        rec("ready-failed", JobStatus.READY, webhook="https://e/6",
+            webhook_status="failed"),
+        rec("ready-no-hook", JobStatus.READY),
+    ]
+    for r in rows:
+        await store.create(r)
+
+    # What the old implementation looked at, filtered by the sweep's own rules.
+    expected = {
+        r.id
+        for r in await store.list()
+        if (r.status in (JobStatus.READY, JobStatus.ERROR, JobStatus.EXPIRED)
+            and r.webhook_url and r.webhook_status is None)
+        or r.status in (JobStatus.PENDING, JobStatus.PROCESSING)
+    }
+    got = {r.id for r in await store.list_recovery_candidates()}
+
+    assert got == expected
+    assert "expired-unheard" in got, "an expired-but-unheard webhook is still re-fired"
+    assert "ready-delivered" not in got and "ready-no-hook" not in got
