@@ -459,7 +459,7 @@ class JobManager:
         ownership (see README limitations).
         """
         recovered = 0
-        for record in await self.store.list():
+        for record in await self.store.list_recovery_candidates():
             if (
                 record.status in TERMINAL_STATUSES
                 and record.webhook_url

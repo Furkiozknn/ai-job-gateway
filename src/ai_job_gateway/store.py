@@ -119,6 +119,32 @@ class JobStore(ABC):
         records.sort(key=lambda r: r.created_at, reverse=True)
         return records[:limit], len(records)
 
+    async def list_recovery_candidates(self) -> list[JobRecord]:
+        """Every job a startup sweep could possibly act on, and no others.
+
+        The sweep in ``JobManager.recover_interrupted_jobs`` cares about
+        exactly two kinds of row: one still ``pending``/``processing``
+        (nothing is driving it after a restart), and one whose webhook
+        outcome was never recorded (``webhook_url`` set, ``webhook_status``
+        still None -- the previous process may have died mid-delivery).
+        Every other row is provably a no-op for that sweep, so a store that
+        can express the predicate should not hand back the whole table:
+        this used to be ``list()``, i.e. the same full-table materialisation
+        that was pushed into SQL for the API's list/stats paths.
+
+        Selection is on the *stored* status, deliberately. A ready row past
+        its result window displays as ``expired``, and the sweep still
+        re-fires its unheard webhook today; keeping the predicate on raw
+        columns preserves that rather than quietly changing it. Expiry is
+        applied to the returned records exactly as ``list()`` applies it.
+        """
+        return [
+            record
+            for record in await self.list()
+            if record.status in (JobStatus.PENDING, JobStatus.PROCESSING)
+            or (record.webhook_url and record.webhook_status is None)
+        ]
+
     async def stats(self) -> dict:
         """Counts by displayed status and by capability, plus the total.
 
@@ -430,6 +456,22 @@ class SQLiteJobStore(JobStore):
     async def list(self) -> list[JobRecord]:
         async with self._lock:
             rows = await asyncio.to_thread(self._select_all)
+        return [_apply_expiry(_row_to_record(r)) for r in rows]
+
+    def _select_recovery_candidates(self) -> list[sqlite3.Row]:
+        # Both predicates are on stored columns, so no expiry-aware CASE is
+        # needed here (see the base-class docstring for why that is the
+        # correct choice rather than an oversight).
+        return self._conn.execute(
+            "SELECT * FROM jobs WHERE status IN (?, ?) "
+            "   OR (webhook_url IS NOT NULL AND webhook_status IS NULL) "
+            "ORDER BY created_at",
+            (JobStatus.PENDING.value, JobStatus.PROCESSING.value),
+        ).fetchall()
+
+    async def list_recovery_candidates(self) -> list[JobRecord]:
+        async with self._lock:
+            rows = await asyncio.to_thread(self._select_recovery_candidates)
         return [_apply_expiry(_row_to_record(r)) for r in rows]
 
     #: The status a caller actually observes: a terminal row whose result
