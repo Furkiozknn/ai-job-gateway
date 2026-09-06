@@ -30,6 +30,9 @@ def _serve(args: argparse.Namespace) -> None:
         default_registry(),
         job_timeout=timedelta(seconds=args.job_timeout) if args.job_timeout > 0 else None,
         max_concurrent_jobs=args.max_concurrent_jobs if args.max_concurrent_jobs > 0 else None,
+        max_concurrent_webhooks=(
+            args.max_concurrent_webhooks if args.max_concurrent_webhooks > 0 else None
+        ),
     )
     # The API key comes from the environment, never an argv flag: process
     # listings and shell history are not places for a credential.
@@ -101,6 +104,17 @@ def main() -> None:
         help=(
             "how many provider runs may execute at once; jobs beyond the cap "
             "queue as 'pending' (0 removes the cap; default: 100)"
+        ),
+    )
+    serve_parser.add_argument(
+        "--max-concurrent-webhooks",
+        type=int,
+        default=10,
+        help=(
+            "how many webhook POSTs may be in flight at once across all jobs; "
+            "a restart that recovers many unheard deliveries fires them in "
+            "waves of this size instead of all at once (0 removes the cap; "
+            "default: 10)"
         ),
     )
     serve_parser.set_defaults(func=_serve)
