@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="1200" height="320" role="img" aria-label="ai-job-gateway - submit a job, get an id instantly, poll or get webhooked">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="55%" stop-color="#101a2e"/>
+      <stop offset="100%" stop-color="#0b1626"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#4c8dff"/>
+      <stop offset="50%" stop-color="#39d3bb"/>
+      <stop offset="100%" stop-color="#a371f7"/>
+    </linearGradient>
+    <linearGradient id="markAccent" gradientUnits="userSpaceOnUse" x1="72" y1="108" x2="146" y2="190">
+      <stop offset="0%" stop-color="#4c8dff"/>
+      <stop offset="60%" stop-color="#39d3bb"/>
+      <stop offset="100%" stop-color="#a371f7"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#4c8dff" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="#4c8dff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="320" fill="url(#bg)"/>
+  <circle cx="960" cy="150" r="230" fill="url(#glow)"/>
+  <rect x="0" y="0" width="1200" height="4" fill="url(#accent)"/>
+
+  <g opacity="0.95">
+    <path d="M866 96 L926 52 L986 96 L986 232 L866 232 Z" fill="#101d31" stroke="#28456b" stroke-width="2"/>
+    <path d="M896 232 L896 150 Q926 122 956 150 L956 232" fill="#0c1524" stroke="#3a6ea8" stroke-width="2"/>
+    <g fill="#6cb6ff">
+      <rect x="806" y="128" width="26" height="14" rx="3"/>
+      <rect x="770" y="156" width="26" height="14" rx="3" opacity="0.75"/>
+      <rect x="806" y="184" width="26" height="14" rx="3" opacity="0.55"/>
+    </g>
+    <g stroke="#4c8dff" stroke-opacity="0.5" stroke-width="1.6" fill="none">
+      <path d="M832 135 L866 150"/><path d="M796 163 L866 164"/><path d="M832 191 L866 178"/>
+    </g>
+    <g stroke="#39d3bb" stroke-width="1.8" fill="none" stroke-opacity="0.8">
+      <path d="M986 122 L1136 122"/><path d="M986 164 L1136 164"/><path d="M986 206 L1136 206"/>
+    </g>
+    <g fill="#39d3bb">
+      <rect x="1044" y="115" width="22" height="14" rx="3"/>
+      <rect x="1080" y="157" width="22" height="14" rx="3" opacity="0.8"/>
+      <rect x="1010" y="199" width="22" height="14" rx="3" opacity="0.6"/>
+    </g>
+    <path d="M1136 206 Q1168 168 1136 128" stroke="#a371f7" stroke-width="1.8" fill="none" stroke-dasharray="5 4"/>
+    <path d="M1136 128 l-8 4 l2 -9 Z" fill="#a371f7"/>
+  </g>
+
+  <g transform="translate(72,108)" fill="none" stroke="url(#markAccent)" stroke-width="7" stroke-linecap="round">
+    <path d="M10 66 L38 16 L66 66"/>
+    <path d="M6 74 L70 74"/>
+  </g>
+
+  <text x="176" y="128" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="46" font-weight="700" fill="#e6edf3">ai-job-gateway</text>
+  <text x="178" y="172" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif" font-size="23" fill="#8b98a9">Submit a job, get an id instantly &#8212; poll or get webhooked.</text>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif" font-size="14.5" font-weight="600">
+    <g transform="translate(178,204)">
+      <rect width="210" height="34" rx="17" fill="#0f2130" stroke="#1f4f7a"/>
+      <text x="105" y="22" text-anchor="middle" fill="#6cb6ff">SSRF-guarded webhooks</text>
+    </g>
+    <g transform="translate(402,204)">
+      <rect width="160" height="34" rx="17" fill="#0f2a24" stroke="#1f6f5c"/>
+      <text x="80" y="22" text-anchor="middle" fill="#56d4b4">idempotency keys</text>
+    </g>
+    <g transform="translate(576,204)">
+      <rect width="180" height="34" rx="17" fill="#1c1730" stroke="#4a3b7a"/>
+      <text x="90" y="22" text-anchor="middle" fill="#b394f7">queryable dead letter</text>
+    </g>
+  </g>
+
+  <text x="178" y="272" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" fill="#5c6b7f">FastAPI &#183; 149 tests &#183; submit &#8594; poll &#8594; webhook &#183; MIT</text>
+</svg>
