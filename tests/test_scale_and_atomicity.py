@@ -22,10 +22,11 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
+import httpx
 import pytest
 
 from ai_job_gateway import clock
-from ai_job_gateway.manager import JobManager
+from ai_job_gateway.manager import DEFAULT_WEBHOOK_CONCURRENCY, JobManager
 from ai_job_gateway.models import JobRecord, JobStatus
 from ai_job_gateway.providers import MockProvider
 from ai_job_gateway.store import InMemoryJobStore, SQLiteJobStore
@@ -206,3 +207,137 @@ async def test_list_page_and_stats_use_the_displayed_status(tmp_path, store_kind
     assert counts["by_capability"] == {"cap-a": 3, "cap-b": 1}
     if isinstance(store, SQLiteJobStore):
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_fires_webhooks_in_waves_not_all_at_once():
+    """The audit's webhook-amplification finding: a restart that recovers N
+    unheard deliveries used to fire all N simultaneously.
+
+    The per-attempt jitter already spread the herd's *retries*, but the
+    first attempt of every recovered delivery went out at the same instant
+    -- a thundering herd at a receiver that is very often recovering from
+    the same outage, and N connections against one shared client pool.
+    """
+    store = InMemoryJobStore()
+    unheard = 25
+    for i in range(unheard):
+        await store.create(
+            JobRecord(
+                id=f"unheard-{i}",
+                capability="echo",
+                provider="mock",
+                params={},
+                status=JobStatus.READY,
+                created_at=clock.now(),
+                updated_at=clock.now(),
+                result={"ok": i},
+                webhook_url=f"https://receiver.example/{i}",
+            )
+        )
+
+    in_flight = 0
+    peak = 0
+
+    async def handler(request):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            # Long enough that every delivery admitted by the cap overlaps.
+            await asyncio.sleep(0.05)
+            return httpx.Response(200)
+        finally:
+            in_flight -= 1
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    cap = 4
+    manager = JobManager(
+        store,
+        {"echo": MockProvider()},
+        http_client=client,
+        max_concurrent_webhooks=cap,
+    )
+
+    await manager.recover_interrupted_jobs()
+    # recover_interrupted_jobs schedules the deliveries and returns; aclose()
+    # closes the client without draining them, so wait for the outcomes.
+    deadline = asyncio.get_event_loop().time() + 5.0
+    while any(r.webhook_status is None for r in await store.list()):
+        assert asyncio.get_event_loop().time() < deadline, "deliveries never finished"
+        await asyncio.sleep(0.01)
+    await manager.aclose()
+
+    assert peak <= cap, f"{peak} webhooks were in flight at once, cap was {cap}"
+    assert peak > 1, "the cap must still allow real concurrency, not serialize"
+    delivered = [r for r in await store.list() if r.webhook_status == "delivered"]
+    assert len(delivered) == unheard, "every recovered webhook must still be delivered"
+
+
+@pytest.mark.asyncio
+async def test_webhook_slot_is_not_held_across_the_backoff_sleep():
+    """A retrying delivery must not occupy a slot while it sleeps.
+
+    Holding the semaphore across the whole retry chain would let a handful
+    of failing webhooks (up to ~65s of backoff) starve every other job's
+    delivery. The slot is taken around the HTTP call only, so a delivery
+    that is backing off leaves room for others to go out.
+    """
+    store = InMemoryJobStore()
+    def _unheard(job_id, url):
+        return JobRecord(
+            id=job_id,
+            capability="echo",
+            provider="mock",
+            params={},
+            status=JobStatus.READY,
+            created_at=clock.now(),
+            updated_at=clock.now(),
+            result={},
+            webhook_url=url,
+        )
+
+    failing = _unheard("fails", "https://receiver.example/always-fails")
+    healthy = _unheard("fine", "https://receiver.example/fine")
+    await store.create(failing)
+    await store.create(healthy)
+
+    healthy_delivered = asyncio.Event()
+
+    async def handler(request):
+        if request.url.path == "/fine":
+            healthy_delivered.set()
+            return httpx.Response(200)
+        return httpx.Response(500)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    # A cap of one: if the failing delivery held its slot through the
+    # backoff, the healthy one could not get out until it exhausted.
+    manager = JobManager(
+        store,
+        {"echo": MockProvider()},
+        http_client=client,
+        max_concurrent_webhooks=1,
+    )
+    await manager.recover_interrupted_jobs()
+    await asyncio.wait_for(healthy_delivered.wait(), timeout=2.0)
+    await manager.aclose()
+
+    assert (await store.get(healthy.id)).webhook_status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_webhook_concurrency_is_capped_by_default():
+    """The two tests above pass an explicit cap, so neither would notice the
+    library default going back to unbounded - a mutation run proved exactly
+    that. A deployment that constructs JobManager without naming the option
+    is the common case, so pin it here.
+    """
+    manager = JobManager(InMemoryJobStore(), {"echo": MockProvider()})
+    try:
+        assert manager._webhook_slots is not None, (
+            "JobManager must cap webhook concurrency by default"
+        )
+        assert DEFAULT_WEBHOOK_CONCURRENCY > 0
+    finally:
+        await manager.aclose()

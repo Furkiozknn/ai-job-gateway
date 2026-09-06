@@ -121,11 +121,15 @@ uv run ai-job-gateway serve
 uv run ai-job-gateway serve --db jobs.db
 ```
 
-Two guardrails are on by default and tunable: `--job-timeout` (600 s) fails
-a provider run that never returns with an honest error instead of leaving
-the job "processing" until the next restart, and `--max-concurrent-jobs`
+Three guardrails are on by default and tunable: `--job-timeout` (600 s)
+fails a provider run that never returns with an honest error instead of
+leaving the job "processing" until the next restart; `--max-concurrent-jobs`
 (100) caps how many provider runs execute at once — jobs beyond the cap
-queue as "pending". Pass `0` to disable either.
+queue as "pending"; and `--max-concurrent-webhooks` (10) caps how many
+webhook POSTs are in flight at once across all jobs, so a restart that
+recovers many unheard deliveries sends them in waves rather than firing
+every one at the same instant at a receiver that is often recovering from
+the same outage. Pass `0` to disable any of them.
 
 Then, from another terminal:
 

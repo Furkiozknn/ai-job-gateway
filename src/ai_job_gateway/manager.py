@@ -56,6 +56,15 @@ WEBHOOK_TIMEOUT_SECONDS = 10.0
 #: analysis: when a receiver hiccups, many jobs finish and retry at once,
 #: and fixed delays re-synchronize that herd onto the recovering receiver
 #: at exactly the same instants.
+#: How many webhook POSTs may be in flight at once, across every job. The
+#: per-attempt jitter above spreads a herd's *retries*, but not its first
+#: attempt: a restart that recovers N unheard deliveries used to fire all N
+#: simultaneously, which is both a thundering herd at a receiver that may
+#: itself be recovering, and N connections against the shared client's pool.
+#: The cap is held only around the HTTP call, never across the backoff
+#: sleep, so a webhook waiting out its backoff does not occupy a slot.
+DEFAULT_WEBHOOK_CONCURRENCY = 10
+
 WEBHOOK_MAX_ATTEMPTS = 5
 WEBHOOK_BACKOFF_BASE_SECONDS = 1.0
 WEBHOOK_BACKOFF_CAP_SECONDS = 30.0
@@ -90,6 +99,7 @@ class JobManager:
         webhook_signing_secret: Optional[str] = None,
         job_timeout: Optional[timedelta] = None,
         max_concurrent_jobs: Optional[int] = None,
+        max_concurrent_webhooks: Optional[int] = DEFAULT_WEBHOOK_CONCURRENCY,
     ) -> None:
         self.store = store
         self.registry = registry
@@ -109,6 +119,11 @@ class JobManager:
         #: unbounded (the historical behavior).
         self._job_slots = (
             asyncio.Semaphore(max_concurrent_jobs) if max_concurrent_jobs else None
+        )
+        #: Cap on webhook POSTs in flight at once (see
+        #: DEFAULT_WEBHOOK_CONCURRENCY). None means unbounded.
+        self._webhook_slots = (
+            asyncio.Semaphore(max_concurrent_webhooks) if max_concurrent_webhooks else None
         )
         # Per-idempotency-key serialization for submit(). The store's
         # recall -> remember -> create sequence yields to the event loop
@@ -366,12 +381,24 @@ class JobManager:
             if delay:
                 await asyncio.sleep(delay)
             try:
-                response = await client.post(
-                    record.webhook_url,
-                    content=body,
-                    headers=headers,
-                    timeout=WEBHOOK_TIMEOUT_SECONDS,
-                )
+                # The slot is taken for the request only. Holding it across
+                # the sleep above would let a few backing-off deliveries
+                # (up to ~65s of retries) starve every other job's webhook.
+                if self._webhook_slots is not None:
+                    async with self._webhook_slots:
+                        response = await client.post(
+                            record.webhook_url,
+                            content=body,
+                            headers=headers,
+                            timeout=WEBHOOK_TIMEOUT_SECONDS,
+                        )
+                else:
+                    response = await client.post(
+                        record.webhook_url,
+                        content=body,
+                        headers=headers,
+                        timeout=WEBHOOK_TIMEOUT_SECONDS,
+                    )
                 response.raise_for_status()
                 await self._record_webhook_outcome(record.id, "delivered")
                 return
