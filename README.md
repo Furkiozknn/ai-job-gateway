@@ -1,3 +1,5 @@
+![ai-job-gateway - submit a job, get an id instantly, then poll or get webhooked](assets/banner.svg)
+
 # ai-job-gateway
 
 **Submit a generative-AI job, get an id back instantly, poll or get webhooked when it's done — a small, hardened, provider-agnostic reference server for the async job contract every serious inference API ends up with.**
