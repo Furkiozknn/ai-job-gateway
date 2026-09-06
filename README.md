@@ -25,6 +25,8 @@ BFL's own hosted API and RunPod's `worker-comfyui` reach the same shape independ
 
 ## Architecture
 
+<img src="assets/lifecycle.svg" alt="The job lifecycle: POST returns an id without blocking, the job moves through pending and processing to ready or error, and a terminal job past its 30-minute result window reads as expired - a status computed at read time, never written to storage and never a 404. Callers either poll the id or receive a signed, SSRF-checked webhook." width="100%">
+
 ```
 ┌─────────────┐   submit/poll    ┌──────────────┐   run(job_id, params)   ┌───────────┐
 │ Your caller │ ───────────────► │  HTTP API     │ ──────────────────────► │ Provider  │
@@ -209,6 +211,8 @@ uv run pytest
 The suite is fully async (`pytest-asyncio`), exercises the manager/store/server/client layers independently and together (server tests drive the FastAPI app in-process via `httpx.ASGITransport` — no real sockets), and verifies expiry/webhook-retry behavior by monkeypatching `ai_job_gateway.clock.now` and webhook delivery via `httpx.MockTransport`, never by sleeping for real minutes.
 
 ## Security notes
+
+<img src="assets/security.svg" alt="What the gateway hardens versus what it deliberately leaves out: capped request bodies, SSRF-checked and HMAC-signed webhooks, constant-time bearer auth and restart-surviving idempotency keys on one side; no per-key identity or quotas, no rate limiting, no DNS-rebinding-proof delivery and no cross-process queue on the other." width="100%">
 
 This is a reference implementation exposed to whatever calls it, so it's worth being explicit about what's hardened and what deliberately isn't:
 
