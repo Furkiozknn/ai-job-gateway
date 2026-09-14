@@ -1,0 +1,75 @@
+# PyPI yayini -- Trusted Publishing (OIDC).
+#
+# Bu is akisinda API ANAHTARI YOKTUR ve olmamalidir. PyPI, GitHub'in
+# imzaladigi kisa omurlu bir OIDC jetonuna guvenir; depoda saklanan,
+# sizabilecek bir sir yok. Tek sartlari: `id-token: write` izni ve
+# PyPI tarafinda bu depo/is akisi icin tanimlanmis bir yayinci.
+#
+# Ilk kullanimdan ONCE PyPI'da bir kez yapilacak (tarayicidan):
+#   pypi.org -> Your projects -> Publishing -> Add a new pending publisher
+#     Owner:            Furkiozknn
+#     Repository:       ai-job-gateway
+#     Workflow name:    yayinla.yml
+#     Environment name: pypi
+#
+# Sonrasinda yayin: `git tag v0.5.0 && git push origin v0.5.0`
+
+name: Yayinla
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yayinla-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  paketle:
+    name: Paketle ve dogrula
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Etiket ile surum ayni mi
+        run: |
+          etiket="${GITHUB_REF_NAME#v}"
+          surum="$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)".*/\1/')"
+          echo "etiket=$etiket  pyproject=$surum"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "$etiket" != "$surum" ]; then
+            echo "::error::Etiket ($etiket) ile pyproject surumu ($surum) uyusmuyor."
+            exit 1
+          fi
+
+      - run: uv build
+
+      - name: twine check
+        run: uvx twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  yayinla:
+    name: PyPI'a gonder
+    needs: paketle
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/ai-job-gateway
+    permissions:
+      id-token: write   # Trusted Publishing icin ZORUNLU
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
