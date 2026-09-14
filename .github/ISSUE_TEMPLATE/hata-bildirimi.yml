@@ -1,0 +1,30 @@
+name: Hata bildirimi
+description: Beklenmeyen bir davranis veya cokme bildir
+title: "[hata] "
+labels: ["hata"]
+body:
+  - type: textarea
+    id: ne-oldu
+    attributes:
+      label: Ne oldu?
+      description: Gordugun davranisi yaz. Hata mesaji varsa aynen yapistir.
+    validations:
+      required: true
+  - type: textarea
+    id: beklenen
+    attributes:
+      label: Ne olmasini bekliyordun?
+    validations:
+      required: true
+  - type: textarea
+    id: adimlar
+    attributes:
+      label: Tekrar uretme adimlari
+    validations:
+      required: true
+  - type: input
+    id: ortam
+    attributes:
+      label: Surum ve isletim sistemi
+    validations:
+      required: true

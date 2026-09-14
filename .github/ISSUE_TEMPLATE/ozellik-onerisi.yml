@@ -1,0 +1,17 @@
+name: Ozellik onerisi
+description: Yeni bir yetenek veya iyilestirme oner
+title: "[oneri] "
+labels: ["oneri"]
+body:
+  - type: textarea
+    id: sorun
+    attributes:
+      label: Hangi sorunu cozuyor?
+    validations:
+      required: true
+  - type: textarea
+    id: cozum
+    attributes:
+      label: Onerdigin cozum
+    validations:
+      required: true
