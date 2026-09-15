@@ -13,6 +13,12 @@ GET  {polling_url}      ->  { "status": "pending"|"processing"|"ready"|"error"|"
 
 Submit a job, get an id back immediately, poll (or get a webhook) until it's done. That's the whole public contract, for *any* generative model — image, video, lip-sync, whatever a `Provider` wraps.
 
+<p align="center">
+  <img src="assets/transcript.svg" alt="A real session: POST returns 202 with an id, the same idempotency key returns the same id, GET returns ready, and a webhook pointing at a link-local address is refused with 422" width="700">
+</p>
+
+<p align="center"><sub><i>A real session against <code>ai-job-gateway serve</code>. The second POST carries the same <code>Idempotency-Key</code> and gets the same id back — no second job. The last one asks the server to call <code>169.254.169.254</code>, and it refuses.</i></sub></p>
+
 This isn't a copy of fal.ai's or RunPod's code — it's an original implementation of the same well-known, provider-independently-discovered API shape, built as a genuinely reusable open-source building block for a small ecosystem of focused AI-creative-platform repos. Elsewhere in that ecosystem, a future image-gen wrapper, video-gen wrapper, or lip-sync wrapper registers itself here as a `Provider` under a capability name, and every one of them gets the same submit/poll/webhook contract, job persistence, and expiry semantics for free.
 
 ## Why this contract
