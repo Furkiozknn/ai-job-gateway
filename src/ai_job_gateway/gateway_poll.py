@@ -1,8 +1,7 @@
 """Shared submit/poll response-interpretation logic for ai-job-gateway
 -compatible HTTP clients.
 
-Vendored, not pip-installed (see ADR-006 and ADR-008 in this repo's
-research/lab/DECISIONS.md): every consuming repo copies this file verbatim
+Vendored, not pip-installed -- each consuming repo copies this file verbatim
 and writes its own thin sync/async wrapper around it, using whichever HTTP
 client (httpx.Client, httpx.AsyncClient, ...) that repo already depends on.
 This module does no I/O of its own, imports nothing beyond the standard
@@ -20,7 +19,7 @@ mapping. It does NOT cover repo-specific behavior that differs on purpose
 poll -- keep handling that locally in each wrapper, before calling into
 this module).
 
-Canonical source: Furkiozknn/Furkiozknn, research/lab/shared/gateway_poll.py
+Canonical copy: ai-job-gateway/src/ai_job_gateway/gateway_poll.py
 Known copies (keep in sync by hand -- there is no import relationship):
   - ai-job-gateway/src/ai_job_gateway/client.py
   - prompt-template-manager/src/prompt_template_manager/gateway_client.py
