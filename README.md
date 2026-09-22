@@ -251,6 +251,22 @@ This is a reference implementation; it's honest about what it isn't:
 - **DNS-rebinding-proof webhook delivery.** See Security notes above — submission-time resolution is checked; pinning resolution at delivery time is left to deployments that need it.
 - **Adaptive batching / multi-stage pipelines.** Out of scope here — see this project's sibling research notes on generative-AI infrastructure patterns for where that fits in a larger system.
 
+### `gateway_poll.py` is copied into three other repositories
+
+The submit/poll contract is interpreted in four places:
+[ai-workflow-engine](https://github.com/Furkiozknn/ai-workflow-engine),
+[model-comparison-harness](https://github.com/Furkiozknn/model-comparison-harness) and
+[prompt-template-manager](https://github.com/Furkiozknn/prompt-template-manager) each carry a
+byte-identical copy of `src/ai_job_gateway/gateway_poll.py`. Copying is a deliberate choice —
+none of the four has to depend on the others — but it has a known cost: copies drift in
+silence. An edge case fixed here keeps biting in the other three, and every repository stays
+green against its own copy.
+
+Each of those repositories now runs `arac/vendor-dogrula.py`, which fetches this file from
+`main`, normalises the package-name difference and fails on anything else. This repository
+prints the fingerprint so a change here is visible as a number worth carrying over. A change
+belongs here first, then in the copies.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
