@@ -81,7 +81,7 @@
   },
   "provenance": {
     "generated_at": "2026-09-22",
-    "generator": "ghcc/gen_meta.py",
+    "generator": "schema/uret.py",
     "rule": "mechanical fields read from the repository and the GitHub API; editorial fields hand-written and reviewed; no field is generated from a guess"
   }
 }
