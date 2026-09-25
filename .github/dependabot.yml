@@ -1,4 +1,7 @@
-# Bagimlilik guncellemelerini haftalik olarak otomatik acar.
+# Ayda bir, ekosistem basina TEK PR (groups). Her paket icin ayri PR,
+# 25 Eylul 2026'da hesapta 36 acik Dependabot PR'i demekti; upload/download-
+# artifact gibi birlikte yukselmesi gereken ciftler de ayni PR'da kalir.
+# Kural: github.com/Furkiozknn/Furkiozknn schema/politika.py
 # NOT: Bu depo uv.lock kullaniyor. Ekosistem "pip" oldugunda dependabot
 # yalnizca pyproject.toml'u guncelliyor, uv.lock'u guncellemiyordu; boylece
 # kilit dosyasi manifest'ten sapiyor ve `uv sync --locked` basarisiz oluyor.
@@ -7,22 +10,25 @@ updates:
   - package-ecosystem: "uv"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps"
     labels:
       - "bagimlilik"
+    groups:
+      uv:
+        patterns: ["*"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
     open-pull-requests-limit: 3
     commit-message:
       prefix: "ci"
     labels:
       - "ci"
-
+    groups:
+      actions:
+        patterns: ["*"]
