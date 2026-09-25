@@ -36,7 +36,9 @@ In a second terminal, submit a job and wait for its result:
 uv run ai-job-gateway submit echo '{"prompt": "hello"}'
 # submitted job 3f2c… -> polling /v1/jobs/3f2c…
 # {
-#   "prompt": "hello"
+#   "echoed": {
+#     "prompt": "hello"
+#   }
 # }
 ```
 
