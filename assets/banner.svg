@@ -1,39 +1,17 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 250" width="1200" height="250" role="img" aria-label="ai-job-gateway - submit a job, get an id instantly, poll or get webhooked">
-<defs>
-  <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-    <stop offset="0%" stop-color="#17161d"/><stop offset="58%" stop-color="#0e0d12"/><stop offset="100%" stop-color="#0b0b0f"/>
-  </linearGradient>
-  <linearGradient id="name" x1="0%" y1="0%" x2="100%" y2="0%">
-    <stop offset="0%" stop-color="#f2efe6"/><stop offset="62%" stop-color="#e7dcc0"/><stop offset="100%" stop-color="#c9a961"/>
-  </linearGradient>
-  <linearGradient id="hair" x1="0%" y1="0%" x2="100%" y2="0%">
-    <stop offset="0%" stop-color="#c9a961" stop-opacity="0.5"/><stop offset="100%" stop-color="#c9a961" stop-opacity="0"/>
-  </linearGradient>
-  <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
-    <feGaussianBlur stdDeviation="3.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-  </filter>
-</defs>
-<rect width="1200" height="250" fill="url(#bg)"/><text x="54" y="96" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-weight="700" font-size="46" fill="url(#name)" letter-spacing="-1">ai-job-gateway</text>
-<text x="56" y="132" font-family="'Segoe UI',Verdana,Helvetica,sans-serif" font-size="17" fill="#c7c2b6" opacity="0.92">Submit a job, get an id instantly — then poll, or take a webhook.</text>
-<line x1="56" y1="152" x2="330" y2="152" stroke="url(#hair)" stroke-width="1.5"/><rect x="56" y="176" width="93" height="26" rx="13" fill="#141419" stroke="#4ade9e" stroke-opacity="0.45"/>
-<text x="102" y="193" text-anchor="middle" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="12" fill="#4ade9e">204 tests</text>
-<rect x="159" y="176" width="181" height="26" rx="13" fill="#141419" stroke="#6cb6ff" stroke-opacity="0.45"/>
-<text x="249" y="193" text-anchor="middle" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="12" fill="#6cb6ff">SSRF-guarded webhooks</text>
-<rect x="350" y="176" width="226" height="26" rx="13" fill="#141419" stroke="#c9a961" stroke-opacity="0.45"/>
-<text x="463" y="193" text-anchor="middle" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="12" fill="#c9a961">idempotency across restarts</text>
-<rect x="586" y="176" width="181" height="26" rx="13" fill="#141419" stroke="#e857c3" stroke-opacity="0.45"/>
-<text x="676" y="193" text-anchor="middle" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="12" fill="#e857c3">queryable dead letter</text><text x="826" y="62" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="11.5" fill="#5c5c68">POST /v1/{capability}</text>
-<rect x="826" y="76" width="86" height="34" rx="8" fill="#141419" stroke="#4ade9e" stroke-opacity="0.45"/>
-<text x="869" y="98" text-anchor="middle" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="12" fill="#4ade9e">202 id</text>
-<line x1="912" y1="93" x2="928" y2="93" stroke="#3a3a46" stroke-width="1.5"/>
-<path d="M928 93 l-6 -3.5 v7 z" fill="#3a3a46"/>
-<rect x="930" y="76" width="86" height="34" rx="8" fill="#141419" stroke="#6cb6ff" stroke-opacity="0.45"/>
-<text x="973" y="98" text-anchor="middle" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="12" fill="#6cb6ff">poll</text>
-<line x1="1016" y1="93" x2="1032" y2="93" stroke="#3a3a46" stroke-width="1.5"/>
-<path d="M1032 93 l-6 -3.5 v7 z" fill="#3a3a46"/>
-<rect x="1034" y="76" width="86" height="34" rx="8" fill="#141419" stroke="#4ade9e" stroke-opacity="0.45"/>
-<text x="1077" y="98" text-anchor="middle" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="12" fill="#4ade9e">ready</text>
-<line x1="869" y1="118" x2="869" y2="146" stroke="#3a3a46" stroke-width="1.5" stroke-dasharray="3 3"/>
-<rect x="826" y="146" width="150" height="32" rx="8" fill="#141419" stroke="#ff5f5f" stroke-opacity="0.5"/>
-<text x="901" y="167" text-anchor="middle" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="11.5" fill="#ff5f5f">422 private webhook</text>
-<text x="988" y="167" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="11" fill="#5c5c68">refused, not called</text><text x="56" y="228" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="12" fill="#5c5c68">Provider-agnostic. FastAPI. submit → poll → webhook. MIT.</text></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-labelledby="t d">
+<!-- generated by github.com/Furkiozknn/Furkiozknn assets/banner/banner.py; edit banners.json there, not this file -->
+<title id="t">ai-job-gateway</title><desc id="d">Submit a job, get an id at once, then poll or take a signed webhook.</desc>
+<defs><radialGradient id="g" cx="1" cy="0" r="0.9"><stop offset="0" stop-color="#e3b341" stop-opacity=".16"/><stop offset="1" stop-color="#e3b341" stop-opacity="0"/></radialGradient>
+<style>.u{font:700 13px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,'DejaVu Sans',sans-serif;letter-spacing:.22em;fill:#d4a95c}.n{font:700 60px/1 ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace;fill:#f2efe6}
+.p{font:400 21px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,'DejaVu Sans',sans-serif;fill:#c9d1d9}.c{fill:none;stroke:#e3b341;stroke-opacity:.55}.ct{font:600 13px/1 ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace;fill:#e3b341}
+.k{font:400 13px/1 ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace;fill:#7d8590}.d{font:500 14px/1 ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace;fill:#e6edf3}.f{font:400 12px/1 ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'DejaVu Sans Mono',monospace;fill:#484f58}</style></defs>
+<rect width="1280" height="320" rx="14" fill="#0d1117"/><rect width="1280" height="320" rx="14" fill="url(#g)"/>
+<rect x="0.5" y="0.5" width="1279" height="319" rx="13.5" fill="none" stroke="#30363d"/>
+<rect x="72" y="0" width="140" height="4" fill="#e3b341"/>
+<text x="72" y="64" class="u">AGENT INFRASTRUCTURE</text>
+<text x="72" y="128" class="n">ai-job-gateway</text>
+<text x="72" y="176" class="p">Submit a job, get an id at once, then poll</text><text x="72" y="206" class="p">or take a signed webhook.</text><rect x="72" y="244" width="238" height="30" rx="15" class="c"/><text x="191" y="264" class="ct" text-anchor="middle">idempotent across restarts</text><rect x="320.4" y="244" width="196" height="30" rx="15" class="c"/><text x="419" y="264" class="ct" text-anchor="middle">SSRF-guarded webhooks</text>
+<line x1="790" y1="60" x2="790" y2="260" stroke="#30363d"/>
+<circle cx="826" cy="96" r="4" fill="#e3b341" opacity="1.00"/><text x="842" y="101" class="k">submit</text><text x="930" y="101" class="d">POST /v1/{capability} -&gt; id</text><circle cx="826" cy="134" r="4" fill="#e3b341" opacity="0.85"/><text x="842" y="139" class="k">poll</text><text x="930" y="139" class="d">queued · running · ready</text><circle cx="826" cy="172" r="4" fill="#e3b341" opacity="0.70"/><text x="842" y="177" class="k">webhook</text><text x="930" y="177" class="d">HMAC-signed, timestamped</text><circle cx="826" cy="210" r="4" fill="#e3b341" opacity="0.55"/><text x="842" y="215" class="k">guard</text><text x="930" y="215" class="d">private hosts refused at dial</text><circle cx="826" cy="248" r="4" fill="#e3b341" opacity="0.40"/><text x="842" y="253" class="k">store</text><text x="930" y="253" class="d">SQLite WAL, survives restarts</text>
+<text x="1208" y="290" class="f" text-anchor="end">github.com/Furkiozknn/ai-job-gateway</text>
+</svg>
