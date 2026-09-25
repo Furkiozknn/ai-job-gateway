@@ -14,13 +14,18 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # pyproject.toml declares 3.11-3.13; test every version it claims.
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       # `--extra media` pulls mini-creative-toolkit from GitHub so the local
       # media capabilities are tested for real, not just skipped.
@@ -44,3 +49,14 @@ jobs:
         run: |
           uv sync --group dev
           uv run pytest -v -q
+
+  package:
+    # The wheel and sdist PyPI would get, built and checked on every push,
+    # not only when a release tag is pushed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv build
+      # twine < 7 rejects the Metadata-Version 2.5 current hatchling writes.
+      - run: uvx --from 'twine>=7' twine check --strict dist/*
