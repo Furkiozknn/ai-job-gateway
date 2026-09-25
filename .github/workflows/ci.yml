@@ -27,6 +27,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --group dev --extra media
 
+      # gateway_poll.py dort depoda birebir ayni tutuluyor ve bu deponun
+      # kopyasi kanonik olanidir. Buradaki kontrol, kanonik dosyanin ana daldaki
+      # haliyle calisma kopyasi arasinda bir fark birakilmadigini gosteriyor --
+      # yani bir degisiklik commit edilmeden once digerlerine kopyalanmasi
+      # gerektigi hatirlanabilsin diye.
+      - name: gateway_poll.py parmak izi
+        run: python3 arac/vendor-dogrula.py --parmak
+
       - name: Run tests
         run: uv run pytest -v
 
