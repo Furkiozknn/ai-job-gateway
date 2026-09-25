@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 406" width="700" height="406" role="img" aria-label="ai-job-gateway — submit, poll, and one webhook the server refused">
+<defs><clipPath id="r"><rect width="700" height="406" rx="9"/></clipPath></defs>
+<g clip-path="url(#r)">
+<rect width="700" height="406" fill="#0e0d12"/>
+<rect width="700" height="34" fill="#17161d"/>
+<line x1="0" y1="34" x2="700" y2="34" stroke="#26252f" stroke-width="1"/>
+<circle cx="20" cy="17.0" r="5" fill="#ff5f57"/>
+<circle cx="38" cy="17.0" r="5" fill="#febc2e"/>
+<circle cx="56" cy="17.0" r="5" fill="#28c840"/>
+<g font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="11.5" xml:space="preserve"><text x="350.0" y="21.0" text-anchor="middle" fill="#6b6b77">ai-job-gateway — submit, poll, and one webhook the server refused</text></g>
+<g font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="13" xml:space="preserve">
+<text x="22.0" y="61.0" fill="#c9a961" font-weight="600">$ </text>
+<text x="37.7" y="61.0" fill="#f2efe6">POST /v1/mock-generate</text>
+<text x="209.9" y="61.0" fill="#6b6b77">        Idempotency-Key: </text>
+<text x="405.7" y="61.0" fill="#9a9aa6">demo-7f3a</text>
+<text x="22.0" y="81.0" fill="#d8d3c6">  { </text>
+<text x="53.3" y="81.0" fill="#6cb6ff">"prompt"</text>
+<text x="116.0" y="81.0" fill="#d8d3c6">: </text>
+<text x="131.6" y="81.0" fill="#4ade9e">"a lighthouse at dusk"</text>
+<text x="303.9" y="81.0" fill="#d8d3c6"> }</text>
+<text x="22.0" y="121.0" fill="#4ade9e" font-weight="600">  202 Accepted</text>
+<text x="131.6" y="121.0" fill="#6b6b77">   5 ms</text>
+<text x="22.0" y="141.0" fill="#d8d3c6">  { </text>
+<text x="53.3" y="141.0" fill="#6cb6ff">"id"</text>
+<text x="84.6" y="141.0" fill="#d8d3c6">: </text>
+<text x="100.3" y="141.0" fill="#4ade9e">"a59ffa0017214742..."</text>
+<text x="264.7" y="141.0" fill="#d8d3c6">, </text>
+<text x="280.4" y="141.0" fill="#6cb6ff">"polling_url"</text>
+<text x="382.2" y="141.0" fill="#d8d3c6">: </text>
+<text x="397.8" y="141.0" fill="#4ade9e">"/v1/jobs/a59ffa…"</text>
+<text x="538.8" y="141.0" fill="#d8d3c6"> }</text>
+<text x="22.0" y="181.0" fill="#9a9aa6">  same key, sent again</text>
+<text x="194.3" y="181.0" fill="#6b6b77">  →  </text>
+<text x="233.4" y="181.0" fill="#4ade9e" font-weight="600">202</text>
+<text x="256.9" y="181.0" fill="#6b6b77">   1 ms   </text>
+<text x="335.2" y="181.0" fill="#9a9aa6">same id, no second job</text>
+<text x="22.0" y="221.0" fill="#c9a961" font-weight="600">$ </text>
+<text x="37.7" y="221.0" fill="#f2efe6">GET /v1/jobs/a59ffa0017214742...</text>
+<text x="22.0" y="241.0" fill="#4ade9e" font-weight="600">  200 OK</text>
+<text x="84.6" y="241.0" fill="#6b6b77">   2 ms</text>
+<text x="22.0" y="261.0" fill="#d8d3c6">  { </text>
+<text x="53.3" y="261.0" fill="#6cb6ff">"status"</text>
+<text x="116.0" y="261.0" fill="#d8d3c6">: </text>
+<text x="131.6" y="261.0" fill="#4ade9e" font-weight="600">"ready"</text>
+<text x="186.4" y="261.0" fill="#d8d3c6">,</text>
+<text x="22.0" y="281.0" fill="#d8d3c6">    </text>
+<text x="53.3" y="281.0" fill="#6cb6ff">"result"</text>
+<text x="116.0" y="281.0" fill="#d8d3c6">: { </text>
+<text x="147.3" y="281.0" fill="#6cb6ff">"output"</text>
+<text x="209.9" y="281.0" fill="#d8d3c6">: </text>
+<text x="225.6" y="281.0" fill="#4ade9e">"mock-result-for-a59ffa00…"</text>
+<text x="437.0" y="281.0" fill="#d8d3c6"> },</text>
+<text x="22.0" y="301.0" fill="#d8d3c6">    </text>
+<text x="53.3" y="301.0" fill="#6cb6ff">"result_expires_at"</text>
+<text x="202.1" y="301.0" fill="#d8d3c6">: </text>
+<text x="217.8" y="301.0" fill="#4ade9e">"2026-09-15T07:00:14Z"</text>
+<text x="390.0" y="301.0" fill="#d8d3c6"> }</text>
+<text x="22.0" y="341.0" fill="#c9a961" font-weight="600">$ </text>
+<text x="37.7" y="341.0" fill="#f2efe6">POST /v1/mock-generate</text>
+<text x="209.9" y="341.0" fill="#6b6b77">  webhook_url=</text>
+<text x="319.5" y="341.0" fill="#9a9aa6">http://169.254.169.254/</text>
+<text x="22.0" y="361.0" fill="#ff5f5f" font-weight="600">  422</text>
+<text x="61.1" y="361.0" fill="#d8d3c6">  webhook_url resolves to a private, loopback or otherwise</text>
+<text x="22.0" y="381.0" fill="#d8d3c6">       non-public address, which this server will not call.</text>
+</g>
+<rect x="0.5" y="0.5" width="699" height="405" rx="9" fill="none" stroke="#26252f"/>
+</g></svg>

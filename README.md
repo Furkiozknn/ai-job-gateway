@@ -13,6 +13,12 @@ GET  {polling_url}      ->  { "status": "pending"|"processing"|"ready"|"error"|"
 
 Submit a job, get an id back immediately, poll (or get a webhook) until it's done. That's the whole public contract, for *any* generative model — image, video, lip-sync, whatever a `Provider` wraps.
 
+<p align="center">
+  <img src="assets/transcript.svg" alt="A real session: POST returns 202 with an id, the same idempotency key returns the same id, GET returns ready, and a webhook pointing at a link-local address is refused with 422" width="700">
+</p>
+
+<p align="center"><sub><i>A real session against <code>ai-job-gateway serve</code>. The second POST carries the same <code>Idempotency-Key</code> and gets the same id back — no second job. The last one asks the server to call <code>169.254.169.254</code>, and it refuses.</i></sub></p>
+
 This isn't a copy of fal.ai's or RunPod's code — it's an original implementation of the same well-known, provider-independently-discovered API shape, built as a genuinely reusable open-source building block for a small ecosystem of focused AI-creative-platform repos. Elsewhere in that ecosystem, a future image-gen wrapper, video-gen wrapper, or lip-sync wrapper registers itself here as a `Provider` under a capability name, and every one of them gets the same submit/poll/webhook contract, job persistence, and expiry semantics for free.
 
 ## Why this contract
@@ -245,6 +251,33 @@ This is a reference implementation; it's honest about what it isn't:
 - **DNS-rebinding-proof webhook delivery.** See Security notes above — submission-time resolution is checked; pinning resolution at delivery time is left to deployments that need it.
 - **Adaptive batching / multi-stage pipelines.** Out of scope here — see this project's sibling research notes on generative-AI infrastructure patterns for where that fits in a larger system.
 
+### `gateway_poll.py` is copied into three other repositories
+
+The submit/poll contract is interpreted in four places:
+[ai-workflow-engine](https://github.com/Furkiozknn/ai-workflow-engine),
+[model-comparison-harness](https://github.com/Furkiozknn/model-comparison-harness) and
+[prompt-template-manager](https://github.com/Furkiozknn/prompt-template-manager) each carry a
+byte-identical copy of `src/ai_job_gateway/gateway_poll.py`. Copying is a deliberate choice —
+none of the four has to depend on the others — but it has a known cost: copies drift in
+silence. An edge case fixed here keeps biting in the other three, and every repository stays
+green against its own copy.
+
+Each of those repositories now runs `arac/vendor-dogrula.py`, which fetches this file from
+`main`, normalises the package-name difference and fails on anything else. This repository
+prints the fingerprint so a change here is visible as a number worth carrying over. A change
+belongs here first, then in the copies.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+## More from this ecosystem
+
+- **[prompt-template-manager](https://github.com/Furkiozknn/prompt-template-manager)** — prompts as YAML in git, rendered by a strict engine
+- **[ai-workflow-engine](https://github.com/Furkiozknn/ai-workflow-engine)** — pipelines as plain YAML DAGs, validated before they run
+- **[model-comparison-harness](https://github.com/Furkiozknn/model-comparison-harness)** — one request, N backends, latency and outcome side by side
+- **[mcp-vet](https://github.com/Furkiozknn/mcp-vet)** — audits an MCP server's source before you install it
+
+<sub>All of them in one searchable page: **[furkiozknn.github.io](https://furkiozknn.github.io/)** — each card is generated from that repository's own <code>project-meta.json</code>.</sub>

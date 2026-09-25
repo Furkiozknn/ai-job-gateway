@@ -15,9 +15,17 @@ Ekosistem: **python**
 ```
 git clone https://github.com/Furkiozknn/ai-job-gateway.git
 cd ai-job-gateway
+uv sync --group dev          # CI de tam olarak bunu calistiriyor
+```
+
+`uv` yoksa ([kurulum](https://docs.astral.sh/uv/getting-started/installation/)),
+aynisini pip ile:
+
+```
 python -m venv .venv
 .venv\Scripts\activate      # Linux/macOS: source .venv/bin/activate
-pip install -e ".[dev]"   # yoksa: pip install -r requirements.txt
+pip install -e .
+pip install pytest pytest-asyncio
 ```
 
 ## 2. Degisikligi yapmadan once

@@ -1,0 +1,87 @@
+{
+  "schema_version": "1.0.0",
+  "id": "ai-job-gateway",
+  "owner": "Furkiozknn",
+  "repository": "https://github.com/Furkiozknn/ai-job-gateway",
+  "homepage": "https://furkiozknn.github.io/#ai-job-gateway",
+  "releases": "https://github.com/Furkiozknn/ai-job-gateway/releases",
+  "status": "active",
+  "category": "backend-service",
+  "platform": [
+    "http-api",
+    "library"
+  ],
+  "primary_language": "Python",
+  "technologies": [
+    "Python 3.11+",
+    "FastAPI",
+    "webhooks"
+  ],
+  "version": "0.1.0",
+  "license": "MIT",
+  "topics": [
+    "api-gateway",
+    "async-jobs",
+    "backend",
+    "dead-letter-queue",
+    "fastapi",
+    "generative-ai",
+    "idempotency",
+    "job-queue",
+    "mcp-ecosystem",
+    "provider-agnostic",
+    "python",
+    "retry",
+    "ssrf-protection",
+    "webhooks"
+  ],
+  "summary": "The async job contract fal.ai, Black Forest Labs and RunPod each arrived at independently, as one hardened reference server: submit, poll, webhook. Idempotency keys that survive a restart, SSRF-guarded signed webhooks, and expiry as a status you can read rather than a silent 404. 156 tests.",
+  "key_features": [
+    "The async job contract fal.ai, Black Forest Labs and RunPod each arrived at independently, as one hardened reference server: submit, poll, webhook",
+    "Idempotency keys that survive a restart",
+    "SSRF-guarded signed webhooks",
+    "Expiry as a status you can read rather than a silent 404"
+  ],
+  "media": {
+    "hero": "assets/banner.svg",
+    "screenshots": [],
+    "gifs": [],
+    "videos": []
+  },
+  "tests": {
+    "count": 156,
+    "source": "CI log: `156 passed`",
+    "measured": "2026-09-15"
+  },
+  "ci": {
+    "workflows": [
+      "ci.yml",
+      "yayinla.yml"
+    ],
+    "badge": "https://github.com/Furkiozknn/ai-job-gateway/actions/workflows/ci.yml/badge.svg"
+  },
+  "docs": {
+    "readme": "README.md",
+    "changelog": null,
+    "version_history": null,
+    "roadmap": null,
+    "security": "SECURITY.md",
+    "contributing": "CONTRIBUTING.md",
+    "license_file": "LICENSE"
+  },
+  "social": {
+    "headline": "Submit, poll, webhook - the async job contract three providers converged on.",
+    "hashtags": [
+      "fastapi",
+      "python",
+      "backend",
+      "generativeai"
+    ],
+    "primary_link": "https://github.com/Furkiozknn/ai-job-gateway"
+  },
+  "provenance": {
+    "generated_at": "2026-09-22",
+    "generator": "schema/uret.py",
+    "rule": "mechanical fields read from the repository and the GitHub API; editorial fields hand-written and reviewed; no field is generated from a guess"
+  }
+}
