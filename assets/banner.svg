@@ -16,7 +16,7 @@
 <rect width="1200" height="250" fill="url(#bg)"/><text x="54" y="96" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-weight="700" font-size="46" fill="url(#name)" letter-spacing="-1">ai-job-gateway</text>
 <text x="56" y="132" font-family="'Segoe UI',Verdana,Helvetica,sans-serif" font-size="17" fill="#c7c2b6" opacity="0.92">Submit a job, get an id instantly — then poll, or take a webhook.</text>
 <line x1="56" y1="152" x2="330" y2="152" stroke="url(#hair)" stroke-width="1.5"/><rect x="56" y="176" width="93" height="26" rx="13" fill="#141419" stroke="#4ade9e" stroke-opacity="0.45"/>
-<text x="102" y="193" text-anchor="middle" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="12" fill="#4ade9e">156 tests</text>
+<text x="102" y="193" text-anchor="middle" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="12" fill="#4ade9e">204 tests</text>
 <rect x="159" y="176" width="181" height="26" rx="13" fill="#141419" stroke="#6cb6ff" stroke-opacity="0.45"/>
 <text x="249" y="193" text-anchor="middle" font-family="'Cascadia Code','JetBrains Mono','SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace" font-size="12" fill="#6cb6ff">SSRF-guarded webhooks</text>
 <rect x="350" y="176" width="226" height="26" rx="13" fill="#141419" stroke="#c9a961" stroke-opacity="0.45"/>
