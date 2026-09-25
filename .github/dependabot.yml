@@ -5,7 +5,8 @@
 # NOT: Bu depo uv.lock kullaniyor. Ekosistem "pip" oldugunda dependabot
 # yalnizca pyproject.toml'u guncelliyor, uv.lock'u guncellemiyordu; boylece
 # kilit dosyasi manifest'ten sapiyor ve `uv sync --locked` basarisiz oluyor.
-# "uv" ekosistemi ikisini birlikte guncelliyor.version: 2
+# "uv" ekosistemi ikisini birlikte guncelliyor.
+version: 2
 updates:
   - package-ecosystem: "uv"
     directory: "/"
