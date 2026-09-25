@@ -2,7 +2,7 @@
 
 ## Desteklenen surumler
 
-Bu proje icin yalnizca **varsayilan dalin ($ana) son hali** desteklenir.
+Bu proje icin yalnizca **varsayilan dalin (`main`) son hali** desteklenir.
 Eski etiketlere geriye donuk yama uygulanmaz; guvenlik duzeltmesi her
 zaman ileriye dogru, yeni bir surumle yayinlanir.
 

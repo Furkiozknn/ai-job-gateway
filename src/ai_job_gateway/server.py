@@ -28,10 +28,12 @@ from typing import Optional, Any
 from urllib.parse import urlsplit
 
 from fastapi import Query, FastAPI, HTTPException, Request
+from pydantic import BaseModel
 
+from . import netguard
 from .exceptions import UnknownCapabilityError
 from .manager import JobManager
-from .models import JobStatus
+from .models import JobRecord, JobStatus
 
 #: Default cap on a submission's raw request body. FastAPI/Starlette place no
 #: limit on body size by default -- `await request.json()` happily buffers an
@@ -63,27 +65,86 @@ _CAPABILITY_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 #: -- at 169.254.169.254 (cloud metadata), 127.0.0.1:<internal port>, or an
 #: RFC-1918 neighbour. So by default the hostname is resolved at submission
 #: time and the URL is rejected if any resolved address is loopback,
-#: private, link-local, reserved, multicast or unspecified. The documented
-#: local-dev workflow (webhook-sink on 127.0.0.1) opts back in with
+#: private, link-local, reserved, multicast or unspecified (see
+#: netguard.is_public_address, which also unwraps IPv4-mapped and NAT64
+#: IPv6). The local-dev workflow (a receiver on 127.0.0.1) opts back in with
 #: `create_app(..., allow_private_webhooks=True)` / `serve
-#: --allow-private-webhooks`. Known residue, on purpose: resolution happens
-#: once at submission, so a DNS name that flips to a private address between
-#: validation and delivery (rebinding) is not caught -- closing that needs
-#: resolution pinning inside the HTTP client, which is beyond what a
-#: reference implementation should hand-roll. The check fails closed: a
-#: hostname that does not resolve is a 422, because "could not check" must
-#: not become "allowed".
+#: --allow-private-webhooks`. This submission-time check is the early,
+#: legible half; the JobManager's webhook transport repeats it at connect
+#: time and pins the connection to the checked address, which is what stops
+#: DNS rebinding. The check fails closed: a hostname that does not resolve
+#: is a 422, because "could not check" must not become "allowed".
 _ALLOWED_WEBHOOK_SCHEMES = {"http", "https"}
+
+
+#: Longest accepted ``Idempotency-Key``. The key is stored per job, so an
+#: unbounded header (uvicorn allows ~64 KB) would be a cheap way to bloat the
+#: store; UUIDs and "order-4711-attempt-1"-style keys fit with room to spare.
+MAX_IDEMPOTENCY_KEY_LENGTH = 255
+
+
+class ErrorBody(BaseModel):
+    """Every error this API raises itself: one human-readable string."""
+
+    detail: str
+
+
+def _errors(**codes: str) -> dict[int | str, dict[str, Any]]:
+    """OpenAPI ``responses`` entries for the given status codes."""
+    return {
+        int(code.lstrip("_")): {"model": ErrorBody, "description": description}
+        for code, description in codes.items()
+    }
+
+
+_UNAUTHORIZED = "Missing or wrong `Authorization: Bearer` key (only when AJG_API_KEY is set)."
+
+_SUBMIT_OPENAPI: dict[str, Any] = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "description": (
+                        "The provider's params, passed through as-is. `webhook_url` is "
+                        "popped out before the provider sees them."
+                    ),
+                    "properties": {
+                        "webhook_url": {
+                            "type": "string",
+                            "format": "uri",
+                            "description": (
+                                "Optional http(s) URL POSTed the job record once it is "
+                                "ready/error. Must resolve to public addresses only."
+                            ),
+                        }
+                    },
+                    "additionalProperties": True,
+                },
+                "example": {"prompt": "a cat riding a bike"},
+            }
+        },
+    },
+    "parameters": [
+        {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": False,
+            "schema": {"type": "string", "maxLength": 255},
+            "description": (
+                "Resubmitting with a key already used returns the original job's id "
+                "instead of creating a second job."
+            ),
+        }
+    ],
+}
 
 
 def _resolve_host(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
     """Every address ``host`` resolves to. Module-level so tests stub DNS out."""
-    try:
-        return [ipaddress.ip_address(host)]
-    except ValueError:
-        pass
-    infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-    return [ipaddress.ip_address(info[4][0]) for info in infos]
+    return netguard.resolve_host(host)
 
 
 async def _read_capped_body(request: Request, max_bytes: int) -> bytes:
@@ -135,7 +196,7 @@ async def _validate_webhook_url(webhook_url: Any, *, allow_private: bool) -> Non
             f"webhook_url host {host!r} did not resolve; a webhook target must be reachable",
         ) from None
     for address in addresses:
-        if not address.is_global:
+        if not netguard.is_public_address(address):
             raise HTTPException(
                 422,
                 "webhook_url resolves to a private, loopback or otherwise "
@@ -161,7 +222,16 @@ def create_app(
     Bearer <key>`` (compared constant-time); ``/health`` stays open, it is a
     liveness probe. Unset keeps the historical open behavior, which is
     acceptable only on the default 127.0.0.1 bind.
+
+    ``allow_private_webhooks=True`` relaxes the destination check at both
+    ends: submission, and the manager's connect-time guard (it sets
+    ``manager.allow_private_webhooks``). Passing it to either place is
+    enough.
     """
+    if allow_private_webhooks:
+        manager.allow_private_webhooks = True
+    else:
+        allow_private_webhooks = manager.allow_private_webhooks
 
     def _require_api_key(request: Request) -> None:
         if api_key is None:
@@ -199,13 +269,30 @@ def create_app(
     )
     app.state.manager = manager
 
-    @app.post("/v1/{capability}", status_code=202)
+    @app.post(
+        "/v1/{capability}",
+        status_code=202,
+        openapi_extra=_SUBMIT_OPENAPI,
+        responses=_errors(
+            _401=_UNAUTHORIZED,
+            _404="No provider is registered under this capability.",
+            _413="Request body exceeds the configured size limit.",
+            _422="Malformed capability name, body, webhook_url or Idempotency-Key.",
+        ),
+    )
     async def submit(capability: str, request: Request) -> dict[str, str]:
+        """Accept a job and return its id immediately; the provider runs in
+        the background."""
         _require_api_key(request)
         if not _CAPABILITY_NAME_RE.match(capability):
             raise HTTPException(
                 422,
                 "capability must be 1-100 characters of letters, digits, '_' or '-'",
+            )
+        idempotency_key = request.headers.get("idempotency-key") or None
+        if idempotency_key is not None and len(idempotency_key) > MAX_IDEMPOTENCY_KEY_LENGTH:
+            raise HTTPException(
+                422, f"Idempotency-Key must be at most {MAX_IDEMPOTENCY_KEY_LENGTH} characters"
             )
 
         raw_body = await _read_capped_body(request, max_body_bytes)
@@ -220,8 +307,6 @@ def create_app(
         webhook_url = params.pop("webhook_url", None)
         await _validate_webhook_url(webhook_url, allow_private=allow_private_webhooks)
 
-        idempotency_key = request.headers.get("idempotency-key") or None
-
         try:
             record = await manager.submit(
                 capability, params, webhook_url=webhook_url, idempotency_key=idempotency_key
@@ -231,8 +316,17 @@ def create_app(
 
         return {"id": record.id, "polling_url": f"/v1/jobs/{record.id}"}
 
-    @app.get("/v1/jobs/{job_id}")
+    @app.get(
+        "/v1/jobs/{job_id}",
+        response_model=JobRecord,
+        responses=_errors(
+            _401=_UNAUTHORIZED,
+            _404="No job with this id.",
+            _410="The job finished but its result window has passed.",
+        ),
+    )
     async def get_job(job_id: str, request: Request) -> dict[str, Any]:
+        """The job record: pending, processing, ready (with result) or error."""
         _require_api_key(request)
         record = await manager.store.get(job_id)
         if record is None:
@@ -241,7 +335,7 @@ def create_app(
             raise HTTPException(410, record.error or "this job's result has expired")
         return record.model_dump(mode="json")
 
-    @app.get("/v1/jobs")
+    @app.get("/v1/jobs", responses=_errors(_401=_UNAUTHORIZED))
     async def list_jobs(
         request: Request,
         status: Optional[str] = None,
@@ -278,13 +372,13 @@ def create_app(
             "total_matching": total_matching,
         }
 
-    @app.get("/v1/stats")
+    @app.get("/v1/stats", responses=_errors(_401=_UNAUTHORIZED))
     async def stats(request: Request) -> dict[str, Any]:
-        _require_api_key(request)
         """Counts by status and by capability - what an operator glances at
         to see whether the queue is draining or a provider is failing.
         Computed by ``JobStore.stats`` (one aggregate query in the SQLite
         store) rather than by materializing every record here."""
+        _require_api_key(request)
         counts = await manager.store.stats()
         by_status = {s.value: 0 for s in JobStatus}
         by_status.update(counts["by_status"])
@@ -295,8 +389,9 @@ def create_app(
             "registered_capabilities": len(manager.registry),
         }
 
-    @app.get("/v1/capabilities")
+    @app.get("/v1/capabilities", responses=_errors(_401=_UNAUTHORIZED))
     async def list_capabilities(request: Request) -> dict[str, str]:
+        """Registered capability names and the provider serving each."""
         _require_api_key(request)
         return {capability: provider.name for capability, provider in manager.registry.items()}
 

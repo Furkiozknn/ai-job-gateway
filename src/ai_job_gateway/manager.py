@@ -16,8 +16,6 @@ change when that swap happens.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import random
@@ -30,18 +28,16 @@ import httpx
 from . import clock
 from .exceptions import UnknownCapabilityError
 from .models import TERMINAL_STATUSES, JobRecord, JobStatus
+from .netguard import WebhookDestinationBlocked, guarded_webhook_client
 from .providers import Provider
 from .store import JobStore
+from .webhook_signing import WEBHOOK_SIGNATURE_HEADER, signature_headers  # noqa: F401 (re-export)
 
 logger = logging.getLogger(__name__)
 
-#: HTTP header a webhook delivery carries the payload's HMAC-SHA256 signature
-#: in, when JobManager was constructed with a `webhook_signing_secret`. A
-#: receiver recomputes the same HMAC over the raw request body and compares
-#: it (constant-time) to this header's value to confirm the request really
-#: came from this gateway and the body wasn't tampered with in transit --
-#: the same shape Stripe/GitHub-style webhook signing uses.
-WEBHOOK_SIGNATURE_HEADER = "X-Gateway-Signature"
+# Webhook signing (headers, what is MACed, the replay window) lives in
+# webhook_signing.py, next to the verify_webhook() helper receivers use.
+# WEBHOOK_SIGNATURE_HEADER is re-exported here for existing imports.
 
 #: How long a ready/error result stays fetchable before GET starts returning
 #: `expired`. Mirrors the BFL API's 10-minute window (this default is more
@@ -108,6 +104,7 @@ class JobManager:
         job_timeout: Optional[timedelta] = None,
         max_concurrent_jobs: Optional[int] = None,
         max_concurrent_webhooks: Optional[int] = DEFAULT_WEBHOOK_CONCURRENCY,
+        allow_private_webhooks: bool = False,
     ) -> None:
         self.store = store
         self.registry = registry
@@ -115,6 +112,15 @@ class JobManager:
         self._http_client = http_client
         self._owns_http_client = http_client is None
         self._webhook_signing_secret = webhook_signing_secret
+        #: When False (the default), the client this manager creates for
+        #: webhooks re-resolves the host at delivery time, refuses non-public
+        #: answers, and connects to the address it checked (see netguard).
+        #: The submission-time check in server.py is not enough on its own:
+        #: DNS can answer differently half an hour later, and the restart
+        #: sweep re-fires URLs that a previous process validated. An
+        #: injected ``http_client`` is used as-is -- its owner decides.
+        #: ``create_app(..., allow_private_webhooks=True)`` sets this too.
+        self.allow_private_webhooks = allow_private_webhooks
         #: How long one provider.run() may take before the job is failed
         #: honestly. None (the library default) preserves the historical
         #: behavior -- but note that without it a provider that never
@@ -157,7 +163,11 @@ class JobManager:
         retry loop's three attempts to the same receiver reuse one socket.
         """
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient()
+            self._http_client = (
+                httpx.AsyncClient()
+                if self.allow_private_webhooks
+                else guarded_webhook_client()
+            )
         return self._http_client
 
     async def aclose(
@@ -405,18 +415,24 @@ class JobManager:
         # httpx's `json=` re-serializes on every attempt, which could in
         # principle drift from whatever was signed.
         body = json.dumps(record.model_dump(mode="json")).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        if self._webhook_signing_secret:
-            signature = hmac.new(
-                self._webhook_signing_secret.encode("utf-8"), body, hashlib.sha256
-            ).hexdigest()
-            headers[WEBHOOK_SIGNATURE_HEADER] = f"sha256={signature}"
 
         last_exc: Optional[Exception] = None
         delays = (0.0, *_webhook_backoff_delays())
         for attempt, delay in enumerate(delays, start=1):
             if delay:
                 await asyncio.sleep(delay)
+            headers = {"Content-Type": "application/json"}
+            if self._webhook_signing_secret:
+                # Re-signed per attempt: the timestamp inside the V2 MAC is
+                # what lets a receiver reject replays, so a retry a minute
+                # later must carry a fresh one.
+                headers.update(
+                    signature_headers(
+                        self._webhook_signing_secret,
+                        body,
+                        int(clock.now().timestamp()),
+                    )
+                )
             try:
                 # The slot is taken for the request only. Holding it across
                 # the sleep above would let a few backing-off deliveries
@@ -438,6 +454,13 @@ class JobManager:
                     )
                 response.raise_for_status()
                 await self._record_webhook_outcome(record.id, "delivered")
+                return
+            except WebhookDestinationBlocked as exc:
+                # A policy refusal, not a network hiccup: retrying cannot
+                # change the answer and would only re-resolve the name four
+                # more times. Dead-letter it now.
+                logger.warning("job %s: webhook not delivered: %s", record.id, exc)
+                await self._record_webhook_outcome(record.id, "failed")
                 return
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc

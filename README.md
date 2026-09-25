@@ -19,6 +19,31 @@ Submit a job, get an id back immediately, poll (or get a webhook) until it's don
 
 <p align="center"><sub><i>A real session against <code>ai-job-gateway serve</code>. The second POST carries the same <code>Idempotency-Key</code> and gets the same id back — no second job. The last one asks the server to call <code>169.254.169.254</code>, and it refuses.</i></sub></p>
 
+## Quick start
+
+Needs Python 3.11+ and [uv](https://docs.astral.sh/uv/). Not on PyPI yet, so install from a clone:
+
+```bash
+git clone https://github.com/Furkiozknn/ai-job-gateway
+cd ai-job-gateway
+uv sync
+uv run ai-job-gateway serve            # http://127.0.0.1:8000, interactive docs at /docs
+```
+
+In a second terminal, submit a job and wait for its result:
+
+```bash
+uv run ai-job-gateway submit echo '{"prompt": "hello"}'
+# submitted job 3f2c… -> polling /v1/jobs/3f2c…
+# {
+#   "echoed": {
+#     "prompt": "hello"
+#   }
+# }
+```
+
+`echo` and `mock-generate` run locally with no key and no network. Next: [Running the reference server](#running-the-reference-server) for curl, persistence and webhooks, and [Writing a new Provider](#writing-a-new-provider) to plug in your own model.
+
 This isn't a copy of fal.ai's or RunPod's code — it's an original implementation of the same well-known, provider-independently-discovered API shape, built as a genuinely reusable open-source building block for a small ecosystem of focused AI-creative-platform repos. Elsewhere in that ecosystem, a future image-gen wrapper, video-gen wrapper, or lip-sync wrapper registers itself here as a `Provider` under a capability name, and every one of them gets the same submit/poll/webhook contract, job persistence, and expiry semantics for free.
 
 ## Why this contract
@@ -174,9 +199,26 @@ curl -X POST http://127.0.0.1:8000/v1/mock-generate \
 
 Your endpoint receives a `POST` with the full job record as JSON once the job reaches `ready` or `error`. Delivery makes up to 5 attempts with capped exponential backoff and full jitter (delay before retry *n* is uniform in `[0, min(30s, 1s·2ⁿ⁻¹)]` — randomized so a herd of jobs finishing during a receiver outage doesn't re-synchronize its retries onto the recovering receiver). The outcome is recorded on the job record as `webhook_status`: `"delivered"` after a 2xx, `"failed"` once every attempt is exhausted — the dead-letter signal, queryable via `GET /v1/jobs/{id}`. The job's own status in the store is already correct regardless of whether the webhook ever arrives, so a caller relying on polling as a fallback is never left with stale state.
 
-`webhook_url` must be an absolute `http://` or `https://` URL — anything else (`file://`, `javascript:`, a bare hostname) is rejected with `422` at submission time, before it's ever stored or dialed. Point it at any local HTTP listener that logs incoming requests to inspect deliveries and exercise the retry behavior against a real server instead of a mock transport.
+`webhook_url` must be an absolute `http://` or `https://` URL — anything else (`file://`, `javascript:`, a bare hostname) is rejected with `422` at submission time, before it's ever stored or dialed. Redirects are never followed: a `3xx` from the receiver counts as a failed attempt. To inspect deliveries against a real listener on your own machine, start the server with `--allow-private-webhooks` (see [Security notes](#security-notes)) and point `webhook_url` at `http://127.0.0.1:<port>/...`.
 
-**Verifying deliveries are genuine.** Construct the `JobManager` with `webhook_signing_secret="..."` and every webhook POST carries an `X-Gateway-Signature: sha256=<hex>` header — the HMAC-SHA256 of the exact request body, keyed by that secret. Your receiver recomputes the same HMAC over the raw body and compares it (constant-time) to the header to confirm the request really came from this gateway and wasn't forged or altered in transit — the same shape Stripe- and GitHub-style webhook signing uses. Signing is opt-in and off by default; nothing about the documented payload shape changes when it's off.
+**Verifying deliveries are genuine.** Set `AJG_WEBHOOK_SECRET` in the server's environment (or construct the `JobManager` with `webhook_signing_secret="..."`) and every delivery attempt carries:
+
+| Header | Value |
+| --- | --- |
+| `X-Gateway-Timestamp` | Unix seconds when this attempt was sent |
+| `X-Gateway-Signature-V2` | `sha256=` + HMAC-SHA256(secret, `"<timestamp>." + raw body`) |
+| `X-Gateway-Signature` | `sha256=` + HMAC-SHA256(secret, raw body) — legacy, kept for existing receivers |
+
+Verify the V2 signature and reject timestamps outside a few minutes: because the timestamp is inside the MAC, a captured delivery can't be replayed later with a new timestamp. The legacy body-only signature proves origin and integrity but not freshness. A Python receiver can use the bundled helper, which compares in constant time:
+
+```python
+from ai_job_gateway.webhook_signing import verify_webhook
+
+if not verify_webhook(secret, raw_body, request.headers):  # default window: 300 s
+    return 401
+```
+
+Each retry is re-signed with a fresh timestamp, so a delivery that succeeds on its fourth attempt still verifies. Receivers should still dedupe on the job `id` in the body, because delivery is at-least-once (see [Restart recovery](#restart-recovery)). Signing is off unless a secret is set; the payload is the same either way.
 
 ### Idempotent submission
 
@@ -188,7 +230,7 @@ curl -X POST http://127.0.0.1:8000/v1/mock-generate \
   -d '{"prompt": "a cat"}'
 ```
 
-The dedupe window is bounded to the 10,000 most recent keys and lives in the job store: with `SQLiteJobStore` it **survives a restart** — a deploy mid-request is exactly when a lost response gets retried, so restart-volatile dedupe would fail at the moment it matters (with `InMemoryJobStore` it is as volatile as the jobs themselves). Omit the header and every submission is independent, exactly as before.
+Keys are at most 255 characters (longer is a `422`). The dedupe window is bounded to the 10,000 most recent keys and lives in the job store: with `SQLiteJobStore` it **survives a restart** — a deploy mid-request is exactly when a lost response gets retried, so restart-volatile dedupe would fail at the moment it matters (with `InMemoryJobStore` it is as volatile as the jobs themselves). Omit the header and every submission is independent, exactly as before.
 
 ### Restart recovery
 
@@ -196,7 +238,9 @@ Background tasks die with the process, so a job still `pending`/`processing` in 
 
 ### Operability
 
-`GET /v1/jobs?status=ready&capability=generate-image&limit=50` lists recent jobs newest first, filtered by either or both, and `GET /v1/stats` returns counts by status and by capability — the two things an operator glances at to see whether the queue is draining or one provider is failing. Both read the store's unpaginated `list()` and filter in memory, which is the honest shape for a reference store.
+`GET /v1/jobs?status=ready&capability=generate-image&limit=50` lists recent jobs newest first, filtered by either or both, and `GET /v1/stats` returns counts by status and by capability — the two things an operator glances at to see whether the queue is draining or one provider is failing. Filtering, sorting, the limit and the counts run inside the store (as SQL queries for `SQLiteJobStore`), so polling these endpoints doesn't scan every job ever created.
+
+The interactive schema is at `/docs` (raw: `/openapi.json`). Every error the API raises itself has the body `{"detail": "<message>"}`.
 
 `GET /health` returns `{"status": "ok"}` and touches nothing but the running process — a liveness probe for a load balancer or orchestrator, independent of whatever `JobStore` backend is degraded or not.
 
@@ -224,20 +268,22 @@ uv sync --group dev
 uv run pytest
 ```
 
-The suite is fully async (`pytest-asyncio`), exercises the manager/store/server/client layers independently and together (server tests drive the FastAPI app in-process via `httpx.ASGITransport` — no real sockets), and verifies expiry/webhook-retry behavior by monkeypatching `ai_job_gateway.clock.now` and webhook delivery via `httpx.MockTransport`, never by sleeping for real minutes.
+The suite is fully async (`pytest-asyncio`), exercises the manager/store/server/client layers independently and together (server tests drive the FastAPI app in-process via `httpx.ASGITransport`), and verifies expiry/webhook-retry behavior by monkeypatching `ai_job_gateway.clock.now` and webhook delivery via `httpx.MockTransport`, never by sleeping for real minutes. The SSRF guard is tested against real sockets on `127.0.0.1` (`tests/test_netguard.py`). The suite never leaves the machine: `tests/conftest.py` refuses any non-loopback DNS lookup or TCP connect and fails the run if one is attempted.
 
 ## Security notes
 
-<img src="assets/security.svg" alt="What the gateway hardens versus what it deliberately leaves out: capped request bodies, SSRF-checked and HMAC-signed webhooks, constant-time bearer auth and restart-surviving idempotency keys on one side; no per-key identity or quotas, no rate limiting, no DNS-rebinding-proof delivery and no cross-process queue on the other." width="100%">
+<img src="assets/security.svg" alt="What the gateway hardens versus what it deliberately leaves out: capped request bodies, webhooks SSRF-checked at submission and again at connect time, timestamp-signed webhooks, constant-time bearer auth and restart-surviving idempotency keys on one side; no per-key identity or quotas, no rate limiting, no purge of finished jobs and no cross-process queue on the other." width="100%">
 
 This is a reference implementation exposed to whatever calls it, so it's worth being explicit about what's hardened and what deliberately isn't:
 
 - **Request body size is capped** (1 MB by default, `create_app(manager, max_body_bytes=...)` to change it). Without this, `POST /v1/{capability}` would buffer an arbitrarily large body into memory before validating anything — a cheap denial-of-service vector. The body is now read as a capped stream, not via a single unbounded `request.json()`.
-- **`webhook_url` is validated by scheme *and* by destination.** Submitting a job asks this server to make an outbound HTTP request to a caller-supplied URL later, on its own schedule — the textbook SSRF shape. Only `http://`/`https://` URLs with a host are accepted (`file://`, `gopher://` → `422`), and by default the hostname is resolved at submission time and rejected if any resolved address is loopback, private, link-local (that includes `169.254.169.254`, the cloud-metadata classic), reserved or multicast. The check fails closed: an unresolvable host is a `422`, because "could not check" must not become "allowed". The documented local-dev workflow — pointing `webhook_url` at a `webhook-sink` on 127.0.0.1 — opts back in with `serve --allow-private-webhooks` (or `create_app(..., allow_private_webhooks=True)`).
-- **Known residue, on purpose:** the destination check runs once, at submission. A DNS name that answers public at validation and private at delivery (rebinding) is not caught — closing that requires resolution pinning inside the HTTP client, which a reference implementation should not hand-roll. A deployment that can't accept that residue should also enforce egress policy at its network boundary.
-- **Optional API key.** Set `AJG_API_KEY` in the server's environment (it is deliberately not a CLI flag — argv leaks into process listings) and every `/v1/*` route requires `Authorization: Bearer <key>`, compared constant-time; `/health` stays open as a liveness probe. The bundled client speaks it too: `JobGatewayClient(url, api_key=...)` sends the header on every request, and `ai-job-gateway submit` reads the same `AJG_API_KEY` from its environment. Unset keeps the historical open behavior, which is acceptable only on the default `127.0.0.1` bind — without a key, anyone who can reach the port can submit compute and read every job's params and results.
+- **`webhook_url` is validated by scheme *and* by destination, twice.** Submitting a job asks this server to make an outbound HTTP request to a caller-supplied URL later, on its own schedule — the textbook SSRF shape. Only `http://`/`https://` URLs with a host are accepted (`file://`, `gopher://` → `422`), and by default the hostname is resolved at submission time and rejected if any resolved address is loopback, private, link-local (that includes `169.254.169.254`, the cloud-metadata classic), reserved, multicast or unspecified. IPv6 forms that carry one of those inside them (`::ffff:127.0.0.1`, NAT64 `64:ff9b::a9fe:a9fe`) are judged by the IPv4 address they carry. The check fails closed: an unresolvable host is a `422`, because "could not check" must not become "allowed".
+- **Checked again when the webhook is sent, and pinned.** DNS can answer differently when the webhook actually fires (rebinding), and the restart sweep re-fires URLs a previous process validated. So the manager's webhook client resolves the host again at connect time, refuses to connect if any answer is non-public (the delivery is marked `webhook_status: "failed"` at once, without retries), and connects to the exact address it checked, not to a second lookup. TLS still verifies the certificate against the URL's hostname. This client ignores `HTTP(S)_PROXY`, because through a proxy the connect-time check would inspect the proxy, not the receiver. If your egress must go through a proxy, pass your own `http_client` to `JobManager`; the guard then doesn't apply and the proxy is where egress policy belongs.
+- **Local development:** pointing `webhook_url` at a receiver on 127.0.0.1 needs `serve --allow-private-webhooks` (or `JobManager(..., allow_private_webhooks=True)` / `create_app(..., allow_private_webhooks=True)`, either one turns off both checks).
+- **Optional API key.** Set `AJG_API_KEY` in the server's environment (it is deliberately not a CLI flag — argv leaks into process listings) and every `/v1/*` route requires `Authorization: Bearer <key>`, compared constant-time; `/health` stays open as a liveness probe. The bundled client speaks it too: `JobGatewayClient(url, api_key=...)` sends the header on every request, and `ai-job-gateway submit` reads the same `AJG_API_KEY` from its environment. Unset keeps the historical open behavior, which is acceptable only on the default `127.0.0.1` bind — without a key, anyone who can reach the port can submit compute and read every job's params and results. `serve --host` with a non-loopback address and no key prints a warning. **Without `AJG_API_KEY`, run the gateway behind your own auth.**
 - **Capability names are constrained** to 1–100 characters of `[A-Za-z0-9_-]`, rejected with `422` otherwise, so a malformed path segment fails fast and legibly rather than becoming an opaque "unknown capability" or an odd log line.
-- **Webhook deliveries can be signed** (HMAC-SHA256, opt-in via `webhook_signing_secret`) so a receiver can verify a delivery genuinely came from this gateway and wasn't forged or tampered with — see [Webhooks](#webhooks) above.
+- **Webhook deliveries can be signed** (HMAC-SHA256 over timestamp and body, opt-in via `AJG_WEBHOOK_SECRET`) so a receiver can verify a delivery came from this gateway, wasn't altered, and isn't a replay. See [Webhooks](#webhooks) above.
+- **Finished jobs are never deleted.** Expiry hides a result from the API (`410`), but the record, including its params, stays in the store. With `--db`, the SQLite file grows until you prune it yourself.
 - **Still absent:** rate limiting and per-key ownership. Authentication exists (the `AJG_API_KEY` bearer key above), but it is one shared key: any holder can submit jobs and read any job's result by id (job ids are unguessable UUIDs, but there's no ownership check), and nothing limits how fast. A public deployment needs per-key identities and quotas before this is safe to expose — see the roadmap below.
 
 ## Roadmap — what a production deployment would add
@@ -248,7 +294,7 @@ This is a reference implementation; it's honest about what it isn't:
 - **Per-key auth & rate limiting.** A single shared `AJG_API_KEY` exists; per-caller identities, ownership checks and quotas do not. A public deployment needs those before this is safe to expose.
 - **Real providers.** `EchoProvider`/`MockProvider` prove the contract; a real deployment implements `Provider` for actual backends (FLUX, Wan2.2, MuseTalk, whatever).
 - **Multi-worker/multi-process coordination.** `InMemoryJobStore` doesn't share state across processes; `SQLiteJobStore` survives a restart and takes its write locks eagerly (`BEGIN IMMEDIATE`, so a second process queues on `busy_timeout` instead of deadlock-aborting), but SQLite is still a single-writer database. A real deployment at that scale wants Postgres (or similar) behind the same `JobStore` interface.
-- **DNS-rebinding-proof webhook delivery.** See Security notes above — submission-time resolution is checked; pinning resolution at delivery time is left to deployments that need it.
+- **Retention.** Deleting jobs whose result window passed long ago; today nothing prunes the store.
 - **Adaptive batching / multi-stage pipelines.** Out of scope here — see this project's sibling research notes on generative-AI infrastructure patterns for where that fits in a larger system.
 
 ### `gateway_poll.py` is copied into three other repositories
