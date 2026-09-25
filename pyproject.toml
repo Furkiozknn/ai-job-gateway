@@ -38,16 +38,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=8.3.0",
-    "pytest-asyncio>=0.24.0",
-]
+# No `dev` extra here on purpose: test dependencies belong in the
+# `[dependency-groups]` table at the bottom, which uv installs and which is
+# NOT published in the wheel. Declaring them as an extra shipped pytest to
+# every consumer as an installable option for no reason.
 # Local media capabilities (media-resize, media-upscale, ...). Optional so the
 # gateway itself stays a four-dependency reference server; opt in to get real
 # local work. Pinned to a commit in uv.lock; bump with
 # `uv lock --upgrade-package mini-creative-toolkit`.
 media = [
-    "mini-creative-toolkit @ git+https://github.com/Furkiozknn/mini-creative-toolkit.git",
+    "mini-creative-toolkit>=2.0.0",
 ]
 
 [project.scripts]
@@ -60,10 +60,18 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/ai_job_gateway"]
 
-# The `media` extra points at a git URL. Hatchling refuses direct references
-# by default because PyPI would reject them; this package is not on PyPI.
-[tool.hatch.metadata]
-allow-direct-references = true
+# Where `mini-creative-toolkit` comes from while it is not yet on PyPI.
+#
+# This is a uv source, not project metadata: `[project.optional-dependencies]`
+# above declares a plain `mini-creative-toolkit>=2.0.0`, which is what ends up
+# in the built wheel. The git URL lives here, is used by `uv sync`/`uv lock`
+# locally and in CI, and never reaches PyPI - which rejects direct references
+# outright, and would have failed the publish job on the first `v*` tag.
+#
+# When mini-creative-toolkit is published, delete this table; nothing else
+# changes.
+[tool.uv.sources]
+mini-creative-toolkit = { git = "https://github.com/Furkiozknn/mini-creative-toolkit.git" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

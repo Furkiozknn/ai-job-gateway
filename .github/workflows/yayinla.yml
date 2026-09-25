@@ -13,6 +13,10 @@
 #     Environment name: pypi
 #
 # Sonrasinda yayin: `git tag v0.5.0 && git push origin v0.5.0`
+#
+# Kayit tamamlanmadan once: Actions -> Yayinla -> Run workflow (kutuyu
+# isaretleme). `paketle` isi kosar, `uv build` + `twine check` gecerse
+# paketlemede sorun yok demektir; hicbir sey yayimlanmaz.
 
 name: Yayinla
 
@@ -20,6 +24,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      yayinla:
+        description: "PyPI'a gercekten gonder (varsayilan: yalniz paketle ve dogrula)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -61,6 +70,11 @@ jobs:
   yayinla:
     name: PyPI'a gonder
     needs: paketle
+    # Etiketle gelen push yayimlar. Elle tetikleme, kutu isaretlenmedikce
+    # yalniz `paketle` isini kosar: Trusted Publishing tanimli olmadan
+    # yayin adimini denemek kirmizi bir kosudan baska bir sey uretmez,
+    # oysa paketlemenin CI'da calistigini gormek gerekli.
+    if: github.event_name == 'push' || inputs.yayinla
     runs-on: ubuntu-latest
     environment:
       name: pypi
