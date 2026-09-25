@@ -10,8 +10,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
+import sys
+
+
+def _is_loopback_bind(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _serve(args: argparse.Namespace) -> None:
@@ -24,22 +35,33 @@ def _serve(args: argparse.Namespace) -> None:
 
     from datetime import timedelta
 
+    api_key = os.environ.get("AJG_API_KEY") or None
+    if api_key is None and not _is_loopback_bind(args.host):
+        print(
+            f"warning: serving on {args.host} with no AJG_API_KEY set -- anyone who can "
+            "reach this port can submit jobs and read every job's params and results. "
+            "Set AJG_API_KEY or put the gateway behind your own auth.",
+            file=sys.stderr,
+        )
+
     store = SQLiteJobStore(args.db) if args.db else InMemoryJobStore()
     manager = JobManager(
         store,
         default_registry(),
+        # Secrets come from the environment, never argv: process listings
+        # and shell history are not places for a credential.
+        webhook_signing_secret=os.environ.get("AJG_WEBHOOK_SECRET") or None,
+        allow_private_webhooks=args.allow_private_webhooks,
         job_timeout=timedelta(seconds=args.job_timeout) if args.job_timeout > 0 else None,
         max_concurrent_jobs=args.max_concurrent_jobs if args.max_concurrent_jobs > 0 else None,
         max_concurrent_webhooks=(
             args.max_concurrent_webhooks if args.max_concurrent_webhooks > 0 else None
         ),
     )
-    # The API key comes from the environment, never an argv flag: process
-    # listings and shell history are not places for a credential.
     app = create_app(
         manager,
         allow_private_webhooks=args.allow_private_webhooks,
-        api_key=os.environ.get("AJG_API_KEY") or None,
+        api_key=api_key,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 
