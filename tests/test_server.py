@@ -36,6 +36,13 @@ def _public_dns(monkeypatch):
     monkeypatch.setattr(server_mod, "_resolve_host", resolve)
 
 
+def _receiver_client() -> httpx.AsyncClient:
+    """A webhook client that answers 200 in-process. Without one, a test that
+    submits with a webhook_url leaves a background task POSTing to the real
+    network after the test ends (see conftest._no_real_network)."""
+    return httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+
+
 def _resolving_to(monkeypatch, mapping):
     def resolve(host):
         return [ipaddress.ip_address(a) for a in mapping[host]]
@@ -50,7 +57,9 @@ def app_and_manager():
         "echo": EchoProvider(),
         "always-fails": MockProvider(delay_seconds=0.01, should_fail=True, failure_message="boom"),
     }
-    manager = JobManager(store, registry, result_ttl=timedelta(minutes=30))
+    manager = JobManager(
+        store, registry, result_ttl=timedelta(minutes=30), http_client=_receiver_client()
+    )
     app = create_app(manager)
     return app, manager
 
@@ -284,10 +293,11 @@ async def test_stats_counts_by_status_and_capability(client):
     assert stats["registered_capabilities"] == 3
 
 
-async def test_shutdown_closes_the_webhook_client_the_manager_created(app_and_manager):
+async def test_shutdown_closes_the_webhook_client_the_manager_created():
     """The lifespan hook is what closes the shared client; exercised through
     the ASGI lifespan protocol rather than by calling aclose() directly."""
-    app, manager = app_and_manager
+    manager = JobManager(InMemoryJobStore(), {"echo": EchoProvider()})
+    app = create_app(manager)
     await manager._webhook_client()
     assert manager._http_client is not None
 
@@ -317,6 +327,11 @@ class TestWebhookHostRestriction:
         "::1",                # IPv6 loopback
         "fd00::1",            # IPv6 ULA
         "0.0.0.0",            # unspecified
+        "224.0.0.1",          # multicast (ipaddress calls it global)
+        "::ffff:127.0.0.1",   # IPv4-mapped loopback
+        "::ffff:169.254.169.254",  # IPv4-mapped metadata
+        "64:ff9b::a9fe:a9fe", # NAT64 of 169.254.169.254 (ipaddress calls it global)
+        "fe80::1",            # IPv6 link-local
     ])
     async def test_literal_non_public_addresses_are_rejected(self, client, address):
         host = f"[{address}]" if ":" in address else address
@@ -360,7 +375,9 @@ class TestWebhookHostRestriction:
         assert resp.status_code == 202
 
     async def test_allow_private_webhooks_restores_the_local_dev_flow(self):
-        manager = JobManager(InMemoryJobStore(), {"echo": EchoProvider()})
+        manager = JobManager(
+            InMemoryJobStore(), {"echo": EchoProvider()}, http_client=_receiver_client()
+        )
         app = create_app(manager, allow_private_webhooks=True)
         transport = ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
@@ -416,3 +433,31 @@ class TestApiKey:
     async def test_no_key_configured_keeps_the_open_behavior(self, client):
         assert (await client.get("/v1/jobs")).status_code == 200
 
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_idempotency_key_is_422(client):
+    resp = await client.post(
+        "/v1/echo", json={"prompt": "hi"}, headers={"Idempotency-Key": "k" * 256}
+    )
+    assert resp.status_code == 422
+    assert "Idempotency-Key" in resp.json()["detail"]
+    ok = await client.post("/v1/echo", json={"prompt": "hi"}, headers={"Idempotency-Key": "k" * 255})
+    assert ok.status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_openapi_documents_what_the_routes_actually_do(client):
+    """The submit route reads its body by hand (to cap its size), so without
+    explicit metadata the schema showed no body, no Idempotency-Key and none
+    of the error codes the route really returns."""
+    spec = (await client.get("/openapi.json")).json()
+    submit = spec["paths"]["/v1/{capability}"]["post"]
+    assert "application/json" in submit["requestBody"]["content"]
+    assert "Idempotency-Key" in [p["name"] for p in submit["parameters"]]
+    assert {"202", "401", "404", "413", "422"} <= set(submit["responses"])
+    assert submit["responses"]["422"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ErrorBody"
+    )
+    get_job = spec["paths"]["/v1/jobs/{job_id}"]["get"]
+    assert {"200", "404", "410"} <= set(get_job["responses"])

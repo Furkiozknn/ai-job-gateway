@@ -41,9 +41,10 @@ jobs:
   paketle:
     name: Paketle ve dogrula
     runs-on: ubuntu-latest
+    timeout-minutes: 10  # olculen en uzun kosu 10 sn
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
         with:
           enable-cache: true
 
@@ -76,6 +77,7 @@ jobs:
     # oysa paketlemenin CI'da calistigini gormek gerekli.
     if: github.event_name == 'push' || inputs.yayinla
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # olculmedi: hic kosmadi; birkac MB'lik yukleme icin ust sinir
     environment:
       name: pypi
       url: https://pypi.org/p/ai-job-gateway
@@ -86,4 +88,4 @@ jobs:
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2

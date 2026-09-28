@@ -13,6 +13,7 @@ Public surface::
         LocalMediaProvider, local_media_registry,  # local media ops (extra: media)
         JobStore, InMemoryJobStore, SQLiteJobStore,
         create_app,         # FastAPI app factory
+        verify_webhook,     # receiver side: check a signed, fresh delivery
     )
 """
 
@@ -33,6 +34,7 @@ from .providers_local import LocalMediaProvider, local_media_registry
 from .providers_pollinations import PollinationsImageProvider
 from .server import create_app
 from .store import InMemoryJobStore, JobStore, SQLiteJobStore
+from .webhook_signing import verify_webhook
 
 __all__ = [
     "JobGatewayClient",
@@ -56,6 +58,7 @@ __all__ = [
     "InMemoryJobStore",
     "JobStore",
     "SQLiteJobStore",
+    "verify_webhook",
 ]
 
 __version__ = "0.1.0"
