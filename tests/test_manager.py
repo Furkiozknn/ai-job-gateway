@@ -74,6 +74,28 @@ async def test_provider_exception_becomes_error_status(store):
 
 
 @pytest.mark.asyncio
+async def test_provider_timeout_error_without_job_timeout_reports_provider_message(store):
+    # A provider's own TimeoutError (a socket or upstream-call timeout) is an
+    # ordinary provider failure. The gateway's job-timeout branch used to
+    # catch it too and then read `self.job_timeout.total_seconds()` -- with
+    # no job_timeout configured that is None, so the handler itself crashed
+    # and the caller got a generic "internal error" instead of the
+    # provider's message.
+    class TimingOutProvider(MockProvider):
+        name = "slow-upstream"
+
+        async def run(self, job_id, params):
+            raise TimeoutError("upstream did not answer")
+
+    manager = JobManager(store, {"slow": TimingOutProvider()})
+    record = await manager.submit("slow", {})
+    final = await _wait_until_terminal(store, record.id)
+
+    assert final.status == JobStatus.ERROR
+    assert final.error == "upstream did not answer"
+
+
+@pytest.mark.asyncio
 async def test_result_expires_after_ttl(monkeypatch, store):
     manager = JobManager(store, {"mock-generate": MockProvider(delay_seconds=0.01)}, result_ttl=timedelta(minutes=5))
     record = await manager.submit("mock-generate", {})

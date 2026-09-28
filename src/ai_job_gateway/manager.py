@@ -360,7 +360,19 @@ class JobManager:
                 )
             else:
                 result = await provider.run(job_id, params)
-        except TimeoutError:
+        except TimeoutError as exc:
+            if self.job_timeout is None:
+                # No gateway timeout is armed, so this TimeoutError came
+                # from the provider itself (a socket or upstream timeout):
+                # report it like any other provider failure. Falling into
+                # the message below would dereference None and turn the
+                # provider's error into a generic "internal error".
+                return await self.store.update_status(
+                    job_id,
+                    status=JobStatus.ERROR,
+                    error=str(exc),
+                    result_expires_at=clock.now() + self.result_ttl,
+                )
             # Without a timeout, a provider that never returns leaves its
             # job "processing" until the next restart's recovery sweep --
             # invisible to the caller until then.
