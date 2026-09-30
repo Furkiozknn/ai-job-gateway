@@ -2,6 +2,18 @@
 of the submit/poll/webhook async job contract used by fal.ai, BFL's own
 hosted API, and RunPod's worker-comfyui.
 
+Quick start (server in one terminal: ``ai-job-gateway serve``)::
+
+    import asyncio
+    from ai_job_gateway import JobGatewayClient
+
+    async def main():
+        async with JobGatewayClient("http://127.0.0.1:8000") as client:
+            handle = await client.submit("echo", {"prompt": "hello"})
+            print(await handle.wait(timeout=30))   # {'echoed': {'prompt': 'hello'}}
+
+    asyncio.run(main())
+
 Public surface::
 
     from ai_job_gateway import (

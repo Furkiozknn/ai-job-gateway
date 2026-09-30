@@ -2,10 +2,50 @@
 
 # ai-job-gateway
 
-<p align="center"><img src="docs/reel/reel.gif" alt="ai-job-gateway - 15-second motion reel" width="720"></p>
-<p align="center"><sub><a href="docs/reel/reel.mp4">MP4 version with sound</a></sub></p>
+**Submit a generative-AI job, get an id back instantly, then poll or get a webhook when it is done: a small, hardened, provider-agnostic server (and Python client) for the async job contract every inference API ends up with.**
 
-**Submit a generative-AI job, get an id back instantly, poll or get webhooked when it's done — a small, hardened, provider-agnostic reference server for the async job contract every serious inference API ends up with.**
+```bash
+uvx --from git+https://github.com/Furkiozknn/ai-job-gateway ai-job-gateway serve   # http://127.0.0.1:8000, docs at /docs
+```
+
+Needs [uv](https://docs.astral.sh/uv/) and Python 3.11+. Not on PyPI. Measured on Windows 11: 19 s from an empty cache to a running server, 7 s when cached. In a second terminal (same `uvx --from ...` prefix, or a clone: see [Running the reference server](#running-the-reference-server)):
+
+```console
+$ ai-job-gateway submit echo '{"prompt": "hello"}'
+submitted job fe738f30cbb44c88ac429382e40c4498 -> polling /v1/jobs/fe738f30cbb44c88ac429382e40c4498
+{
+  "echoed": {
+    "prompt": "hello"
+  }
+}
+
+$ curl -s -X POST http://127.0.0.1:8000/v1/mock-generate -H 'Idempotency-Key: order-4711' -d '{"prompt": "a cat"}'
+{"id":"f007b3f697f14605a999b979b23b0f41","polling_url":"/v1/jobs/f007b3f697f14605a999b979b23b0f41"}
+
+$ # the same key again returns the same id, no second job
+$ curl -s -X POST http://127.0.0.1:8000/v1/mock-generate -H 'Idempotency-Key: order-4711' -d '{"prompt": "a cat"}'
+{"id":"f007b3f697f14605a999b979b23b0f41","polling_url":"/v1/jobs/f007b3f697f14605a999b979b23b0f41"}
+
+$ curl -s http://127.0.0.1:8000/v1/jobs/f007b3f697f14605a999b979b23b0f41 | python -c "import json,sys;d=json.load(sys.stdin);print(d['status'],d['result']['output'])"
+ready mock-result-for-f007b3f697f14605a999b979b23b0f41
+
+$ curl -s -X POST http://127.0.0.1:8000/v1/echo -d '{"x": 1, "webhook_url": "http://169.254.169.254/latest"}'
+{"detail":"webhook_url resolves to a private, loopback or otherwise non-public address, which this server will not call. Run with --allow-private-webhooks to permit this in local development."}
+
+$ ai-job-gateway submit nope '{"a": 1}'
+error: the gateway rejected the job (HTTP 404): unknown capability: 'nope'
+list the capabilities this server has: curl http://127.0.0.1:8000/v1/capabilities
+```
+
+<sub>Real output of one session, unedited apart from the omitted `[exit N]` lines (the last command exits 1). `echo` and `mock-generate` are local stand-ins: they run no model and need no key, no account and no network.</sub>
+
+### When to use it, when not
+
+Use it when you are putting a slow generative backend (image, video, lip-sync, anything a `Provider` can wrap) behind an HTTP API and want the submit / poll / webhook contract, restart-safe idempotency keys, an SSRF-guarded signed webhook and a readable `expired` status without writing them yourself; or as a small, readable reference for that contract.
+
+Do not use it as a multi-tenant public service: there is one shared API key, no per-caller identity, no rate limiting, no purge of finished jobs, and the queue is in-process (one server process; SQLite is single-writer). See [Security notes](#security-notes) and the [Roadmap](#roadmap--what-a-production-deployment-would-add). It also ships no model: real work comes from a `Provider` you write, or the optional `media` extra.
+
+## The contract
 
 A provider-agnostic, self-hostable reference implementation of the async job contract independently converged on by [fal.ai](https://fal.ai), [Black Forest Labs' own hosted API](https://bfl.ai), and RunPod's [`worker-comfyui`](https://github.com/runpod-workers/worker-comfyui):
 
@@ -16,33 +56,15 @@ GET  {polling_url}      ->  { "status": "pending"|"processing"|"ready"|"error"|"
 
 Submit a job, get an id back immediately, poll (or get a webhook) until it's done. That's the whole public contract, for *any* generative model — image, video, lip-sync, whatever a `Provider` wraps.
 
-<p align="center">
-  <img src="assets/transcript.svg" alt="A real session: POST returns 202 with an id, the same idempotency key returns the same id, GET returns ready, and a webhook pointing at a link-local address is refused with 422" width="700">
-</p>
+## Install from a clone
 
-<p align="center"><sub><i>A real session against <code>ai-job-gateway serve</code>. The second POST carries the same <code>Idempotency-Key</code> and gets the same id back — no second job. The last one asks the server to call <code>169.254.169.254</code>, and it refuses.</i></sub></p>
-
-## Quick start
-
-Needs Python 3.11+ and [uv](https://docs.astral.sh/uv/). Not on PyPI yet, so install from a clone:
+For development, or to use `uv run` instead of `uvx`:
 
 ```bash
 git clone https://github.com/Furkiozknn/ai-job-gateway
 cd ai-job-gateway
 uv sync
 uv run ai-job-gateway serve            # http://127.0.0.1:8000, interactive docs at /docs
-```
-
-In a second terminal, submit a job and wait for its result:
-
-```bash
-uv run ai-job-gateway submit echo '{"prompt": "hello"}'
-# submitted job 3f2c… -> polling /v1/jobs/3f2c…
-# {
-#   "echoed": {
-#     "prompt": "hello"
-#   }
-# }
 ```
 
 `echo` and `mock-generate` run locally with no key and no network. Next: [Running the reference server](#running-the-reference-server) for curl, persistence and webhooks, and [Writing a new Provider](#writing-a-new-provider) to plug in your own model.

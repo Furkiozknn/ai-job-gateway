@@ -67,7 +67,10 @@ def _serve(args: argparse.Namespace) -> None:
 
 
 def _submit(args: argparse.Namespace) -> None:
+    import httpx
+
     from .client import JobGatewayClient
+    from .exceptions import JobExpiredError, JobFailedError, JobSubmissionError
 
     async def run() -> None:
         try:
@@ -85,16 +88,62 @@ def _submit(args: argparse.Namespace) -> None:
             result = await handle.wait(timeout=args.timeout)
             print(json.dumps(result, indent=2))
 
-    asyncio.run(run())
+    # One readable line per failure and exit 1, never a traceback: the usual
+    # first mistakes are "no server running" and a mistyped capability.
+    try:
+        asyncio.run(run())
+    except httpx.TransportError as exc:
+        raise SystemExit(
+            f"error: cannot reach a gateway at {args.url} ({type(exc).__name__}). "
+            "Start one in another terminal with: ai-job-gateway serve"
+        )
+    except JobSubmissionError as exc:
+        hint = ""
+        if exc.status_code == 404:
+            hint = f"\nlist the capabilities this server has: curl {args.url}/v1/capabilities"
+        elif exc.status_code == 401:
+            hint = "\nthe server wants a key: set AJG_API_KEY in this shell"
+        try:  # the server answers {"detail": "..."}; show just the sentence
+            detail = json.loads(exc.message)["detail"]
+        except (ValueError, KeyError, TypeError):
+            detail = exc.message
+        raise SystemExit(f"error: the gateway rejected the job (HTTP {exc.status_code}): {detail}{hint}")
+    except (JobFailedError, JobExpiredError) as exc:
+        raise SystemExit(f"error: {exc}")
+    except TimeoutError as exc:
+        raise SystemExit(f"error: {exc}. The job is still running on the server; raise --timeout to wait longer.")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="ai-job-gateway")
+    parser = argparse.ArgumentParser(
+        prog="ai-job-gateway",
+        description=(
+            "Submit a job, get an id back at once, poll or get a webhook when it is done: "
+            "a small self-hosted server (and a client) for the async job contract."
+        ),
+        epilog=(
+            "quick start (two terminals):\n"
+            "  ai-job-gateway serve\n"
+            "  ai-job-gateway submit echo '{\"prompt\": \"hello\"}'\n"
+            "\n"
+            "environment: AJG_API_KEY (require / send a bearer key), "
+            "AJG_WEBHOOK_SECRET (sign webhook deliveries).\n"
+            "'serve --help' and 'submit --help' list every option."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    serve_parser = subparsers.add_parser("serve", help="run the reference HTTP server")
-    serve_parser.add_argument("--host", default="127.0.0.1")
-    serve_parser.add_argument("--port", type=int, default=8000)
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="run the reference HTTP server",
+        description="Run the HTTP server (interactive docs at /docs). Capabilities: echo and "
+        "mock-generate run locally with no key; generate-image is hosted and sends the prompt "
+        "off-machine; media-* appear when the 'media' extra is installed.",
+        epilog="example: ai-job-gateway serve --db jobs.db   (keep jobs across restarts)",
+    )
+    serve_parser.add_argument("--host", default="127.0.0.1", help="address to bind (default: 127.0.0.1)")
+    serve_parser.add_argument("--port", type=int, default=8000, help="port to listen on (default: 8000)")
     serve_parser.add_argument(
         "--allow-private-webhooks",
         action="store_true",
@@ -142,12 +191,22 @@ def main() -> None:
     serve_parser.set_defaults(func=_serve)
 
     submit_parser = subparsers.add_parser(
-        "submit", help="submit a job to a running server and wait for the result"
+        "submit",
+        help="submit a job to a running server and wait for the result",
+        description="Submit one job to a running server, poll until it finishes and print "
+        "the result as JSON. Exit 0 on success, 1 on any failure.",
+        epilog="example: ai-job-gateway submit echo '{\"prompt\": \"hello\"}'",
     )
-    submit_parser.add_argument("capability")
+    submit_parser.add_argument(
+        "capability", help="what to run, e.g. echo or mock-generate (see GET /v1/capabilities)"
+    )
     submit_parser.add_argument("params", help='JSON object of params, e.g. \'{"prompt": "hi"}\'')
-    submit_parser.add_argument("--url", default="http://127.0.0.1:8000")
-    submit_parser.add_argument("--timeout", type=float, default=60.0)
+    submit_parser.add_argument(
+        "--url", default="http://127.0.0.1:8000", help="gateway address (default: %(default)s)"
+    )
+    submit_parser.add_argument(
+        "--timeout", type=float, default=60.0, help="seconds to wait for the result (default: %(default)s)"
+    )
     submit_parser.set_defaults(func=_submit)
 
     args = parser.parse_args()
