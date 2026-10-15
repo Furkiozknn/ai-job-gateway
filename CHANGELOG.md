@@ -4,6 +4,19 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- An `Idempotency-Key` reused with a different request (capability, params
+  or `webhook_url`) is now rejected with `422` instead of silently returning
+  the original, unrelated job. A SHA-256 fingerprint of the canonical request
+  JSON is stored with the key (`SQLiteJobStore` adds a `fingerprint` column
+  to an existing database on open). Keys remembered before this change are
+  compared against their original job record. `JobManager.submit()` raises
+  the new `IdempotencyKeyReusedError`; `JobStore` gains two non-abstract
+  methods, `remember_idempotency_fingerprint` and
+  `recall_idempotency_fingerprint`, so custom stores keep working unchanged.
+
 ## [0.1.0] - 2026-09-25
 
 First tagged release. Everything below is in it.

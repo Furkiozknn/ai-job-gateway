@@ -255,6 +255,13 @@ curl -X POST http://127.0.0.1:8000/v1/mock-generate \
   -d '{"prompt": "a cat"}'
 ```
 
+A retry has to be the *same* request. The gateway stores a fingerprint of each keyed submission (SHA-256 over the canonical JSON of the capability, the params and `webhook_url`; key order and whitespace do not matter), and a key reused with a different request gets `422` instead of the unrelated original job. This is what Stripe does, and what the IETF [Idempotency-Key draft](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/) recommends:
+
+```console
+$ curl -s -X POST http://127.0.0.1:8000/v1/mock-generate -H 'Idempotency-Key: order-4711' -d '{"prompt": "a dog"}'
+{"detail":"Idempotency-Key 'order-4711' was already used for a different request (capability, params or webhook_url); use a new key for a new request"}
+```
+
 Keys are at most 255 characters (longer is a `422`). The dedupe window is bounded to the 10,000 most recent keys and lives in the job store: with `SQLiteJobStore` it **survives a restart** — a deploy mid-request is exactly when a lost response gets retried, so restart-volatile dedupe would fail at the moment it matters (with `InMemoryJobStore` it is as volatile as the jobs themselves). Omit the header and every submission is independent, exactly as before.
 
 ### Restart recovery
