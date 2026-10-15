@@ -4,6 +4,24 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Job cancellation: `POST /v1/jobs/{id}/cancel` stops a `pending` or
+  `processing` job (`200` with the record, `409` once the job has finished,
+  `404` for an unknown id). A pending job never starts; a running provider's
+  task is cancelled. The job reads `error` with the fixed message
+  `CANCELLED_ERROR`, so the public status set is unchanged, and its webhook
+  fires once. A provider that ignores the cancellation is recorded as
+  cancelled after `CANCEL_GRACE_SECONDS` (5 s) and its late result is
+  discarded. Also `JobManager.cancel()`, `JobGatewayClient.cancel()`,
+  `JobHandle.cancel()`, `JobGatewayClient.handle(job_id)`, the
+  `JobNotCancellableError` exception and an `ai-job-gateway cancel` command.
+
+### Changed
+- The provider call runs as its own asyncio task inside the job's task, so a
+  cancellation stops exactly the provider and never a store write in flight.
+
 ## [0.1.0] - 2026-09-25
 
 First tagged release. Everything below is in it.
