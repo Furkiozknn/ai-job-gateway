@@ -286,6 +286,8 @@ asyncio.run(main())
 
 `handle.wait()` raises `JobFailedError` on an `error` status, `JobExpiredError` if the result expires before you fetch it, and plain `TimeoutError` if your `timeout` elapses first.
 
+Each poll retries a network error or a `502`/`503`/`504` up to three times, after 0.5 s, 1 s and 2 s, before raising it. The schedule lives in the vendored `gateway_poll.py`, so the other repositories retry the same way. A successful submission whose body is not the documented `{id, polling_url}` object raises `JobSubmissionError` with the reason, not a `KeyError`.
+
 ## Development
 
 ```bash
