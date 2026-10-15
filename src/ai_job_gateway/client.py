@@ -17,12 +17,14 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any, Optional
+from urllib.parse import quote
 
 import httpx
 
 from .exceptions import (
     JobExpiredError,
     JobFailedError,
+    JobNotCancellableError,
     JobNotFoundError,
     JobSubmissionError,
 )
@@ -80,6 +82,27 @@ class JobHandle:
                 )
             await asyncio.sleep(poll_interval)
 
+    async def cancel(self) -> dict[str, Any]:
+        """Ask the server to stop this job; returns the cancelled record.
+
+        The record reads ``status == "error"`` with the server's fixed
+        cancellation message as ``error``, so a ``wait()`` running elsewhere
+        ends with ``JobFailedError``. Raises ``JobNotCancellableError`` if
+        the job already finished and ``JobNotFoundError`` for an unknown id.
+        """
+        url = resolve_polling_url(self._client._base_url, self.polling_url).rstrip("/") + "/cancel"
+        response = await self._client._http.post(url, headers=self._client._auth_headers)
+        if response.status_code == 404:
+            raise JobNotFoundError(self.job_id)
+        if response.status_code == 409:
+            try:
+                detail = str(response.json().get("detail", "")) or None
+            except (ValueError, AttributeError):
+                detail = response.text or None
+            raise JobNotCancellableError(self.job_id, "finished", detail)
+        response.raise_for_status()
+        return response.json()
+
 
 class JobGatewayClient:
     """Talks to a running ai-job-gateway server."""
@@ -130,6 +153,15 @@ class JobGatewayClient:
         except GatewayHTTPError as exc:
             raise JobSubmissionError(exc.status_code, exc.body_text) from exc
         return JobHandle(self, job_id, polling_url)
+
+    def handle(self, job_id: str) -> JobHandle:
+        """A handle to a job submitted earlier (by id), e.g. to cancel it
+        or wait on it from another process."""
+        return JobHandle(self, job_id, f"/v1/jobs/{quote(job_id, safe='')}")
+
+    async def cancel(self, job_id: str) -> dict[str, Any]:
+        """Cancel a job by id; see ``JobHandle.cancel``."""
+        return await self.handle(job_id).cancel()
 
     async def aclose(self) -> None:
         if self._owns_http:
