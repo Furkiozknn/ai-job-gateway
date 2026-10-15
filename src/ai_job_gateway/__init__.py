@@ -40,6 +40,7 @@ from .exceptions import (
     UnknownCapabilityError,
 )
 from .manager import JobManager
+from .metrics import GatewayMetrics
 from .models import JobRecord, JobStatus
 from .providers import EchoProvider, MockProvider, Provider, ProviderError
 from .providers_local import LocalMediaProvider, local_media_registry
@@ -57,6 +58,7 @@ __all__ = [
     "JobSubmissionError",
     "UnknownCapabilityError",
     "JobManager",
+    "GatewayMetrics",
     "JobRecord",
     "JobStatus",
     "EchoProvider",
