@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from .client import JobGatewayClient, JobHandle
 from .exceptions import (
+    IdempotencyKeyReusedError,
     JobExpiredError,
     JobFailedError,
     JobNotFoundError,
@@ -51,6 +52,7 @@ from .webhook_signing import verify_webhook
 __all__ = [
     "JobGatewayClient",
     "JobHandle",
+    "IdempotencyKeyReusedError",
     "JobExpiredError",
     "JobFailedError",
     "JobNotFoundError",

@@ -169,6 +169,21 @@ class JobStore(ABC):
     async def recall_idempotency_key(self, key: str) -> Optional[str]:
         """The job id ``key`` previously led to, or None."""
 
+    async def remember_idempotency_fingerprint(self, key: str, fingerprint: str) -> None:
+        """Attach the request fingerprint to an already-remembered ``key``.
+
+        The fingerprint (see ``manager.request_fingerprint``) is what lets a
+        reused key with a *different* request be refused instead of silently
+        answered with the unrelated original job. Re-remembering the key
+        itself clears it. Not abstract, so a store written before this
+        existed keeps working: the default keeps nothing, and the manager
+        then fingerprints the original job record instead.
+        """
+
+    async def recall_idempotency_fingerprint(self, key: str) -> Optional[str]:
+        """The fingerprint stored for ``key``, or None if none was kept."""
+        return None
+
     @abstractmethod
     async def set_webhook_status(self, job_id: str, webhook_status: str) -> None:
         """Record webhook delivery outcome ("delivered"/"failed") without
@@ -185,6 +200,7 @@ class InMemoryJobStore(JobStore):
     def __init__(self) -> None:
         self._jobs: dict[str, JobRecord] = {}
         self._idempotency_keys: dict[str, str] = {}
+        self._idempotency_fingerprints: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
     async def create(self, record: JobRecord) -> None:
@@ -227,13 +243,25 @@ class InMemoryJobStore(JobStore):
     async def remember_idempotency_key(self, key: str, job_id: str) -> None:
         async with self._lock:
             self._idempotency_keys.pop(key, None)  # re-insert moves it to newest
+            self._idempotency_fingerprints.pop(key, None)  # a new mapping starts bare
             if len(self._idempotency_keys) >= MAX_IDEMPOTENCY_KEYS:
-                self._idempotency_keys.pop(next(iter(self._idempotency_keys)))
+                evicted = next(iter(self._idempotency_keys))
+                self._idempotency_keys.pop(evicted)
+                self._idempotency_fingerprints.pop(evicted, None)
             self._idempotency_keys[key] = job_id
 
     async def recall_idempotency_key(self, key: str) -> Optional[str]:
         async with self._lock:
             return self._idempotency_keys.get(key)
+
+    async def remember_idempotency_fingerprint(self, key: str, fingerprint: str) -> None:
+        async with self._lock:
+            if key in self._idempotency_keys:
+                self._idempotency_fingerprints[key] = fingerprint
+
+    async def recall_idempotency_fingerprint(self, key: str) -> Optional[str]:
+        async with self._lock:
+            return self._idempotency_fingerprints.get(key)
 
     async def set_webhook_status(self, job_id: str, webhook_status: str) -> None:
         async with self._lock:
@@ -265,7 +293,8 @@ _IDEMPOTENCY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     key TEXT PRIMARY KEY,
     job_id TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    fingerprint TEXT
 )
 """
 
@@ -326,6 +355,12 @@ class SQLiteJobStore(JobStore):
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(jobs)")}
         if "webhook_status" not in columns:
             self._conn.execute("ALTER TABLE jobs ADD COLUMN webhook_status TEXT")
+        # Same for the request fingerprint on idempotency keys. Rows written
+        # before it existed keep a NULL fingerprint; the manager falls back
+        # to fingerprinting the original job record for those.
+        key_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(idempotency_keys)")}
+        if "fingerprint" not in key_columns:
+            self._conn.execute("ALTER TABLE idempotency_keys ADD COLUMN fingerprint TEXT")
         # Indexes for the hot paths the audit measured: newest-first paging
         # (list_page), status-filtered listings, and the idempotency-key
         # eviction sort, which otherwise re-sorts the whole key table on
@@ -572,6 +607,30 @@ class SQLiteJobStore(JobStore):
     async def recall_idempotency_key(self, key: str) -> Optional[str]:
         async with self._lock:
             return await asyncio.to_thread(self._recall_key, key)
+
+    def _remember_fingerprint(self, key: str, fingerprint: str) -> None:
+        self._write_txn(
+            [
+                (
+                    "UPDATE idempotency_keys SET fingerprint = ? WHERE key = ?",
+                    (fingerprint, key),
+                )
+            ]
+        )
+
+    async def remember_idempotency_fingerprint(self, key: str, fingerprint: str) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._remember_fingerprint, key, fingerprint)
+
+    def _recall_fingerprint(self, key: str) -> Optional[str]:
+        row = self._conn.execute(
+            "SELECT fingerprint FROM idempotency_keys WHERE key = ?", (key,)
+        ).fetchone()
+        return row["fingerprint"] if row is not None else None
+
+    async def recall_idempotency_fingerprint(self, key: str) -> Optional[str]:
+        async with self._lock:
+            return await asyncio.to_thread(self._recall_fingerprint, key)
 
     def _set_webhook_status(self, job_id: str, webhook_status: str, updated_at: datetime) -> None:
         self._write_txn(

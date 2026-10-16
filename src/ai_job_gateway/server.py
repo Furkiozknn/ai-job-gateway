@@ -31,7 +31,7 @@ from fastapi import Query, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from . import netguard
-from .exceptions import UnknownCapabilityError
+from .exceptions import IdempotencyKeyReusedError, UnknownCapabilityError
 from .manager import JobManager
 from .models import JobRecord, JobStatus
 
@@ -134,8 +134,9 @@ _SUBMIT_OPENAPI: dict[str, Any] = {
             "required": False,
             "schema": {"type": "string", "maxLength": 255},
             "description": (
-                "Resubmitting with a key already used returns the original job's id "
-                "instead of creating a second job."
+                "Resubmitting the same request with a key already used returns the "
+                "original job's id instead of creating a second job. Reusing a key "
+                "with a different request (capability, params or webhook_url) is a 422."
             ),
         }
     ],
@@ -277,7 +278,10 @@ def create_app(
             _401=_UNAUTHORIZED,
             _404="No provider is registered under this capability.",
             _413="Request body exceeds the configured size limit.",
-            _422="Malformed capability name, body, webhook_url or Idempotency-Key.",
+            _422=(
+                "Malformed capability name, body, webhook_url or Idempotency-Key, "
+                "or an Idempotency-Key reused with a different request."
+            ),
         ),
     )
     async def submit(capability: str, request: Request) -> dict[str, str]:
@@ -313,6 +317,8 @@ def create_app(
             )
         except UnknownCapabilityError as exc:
             raise HTTPException(404, str(exc))
+        except IdempotencyKeyReusedError as exc:
+            raise HTTPException(422, str(exc))
 
         return {"id": record.id, "polling_url": f"/v1/jobs/{record.id}"}
 
