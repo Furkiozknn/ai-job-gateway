@@ -45,6 +45,14 @@ Use it when you are putting a slow generative backend (image, video, lip-sync, a
 
 Do not use it as a multi-tenant public service: there is one shared API key, no per-caller identity, no rate limiting, no purge of finished jobs, and the queue is in-process (one server process; SQLite is single-writer). See [Security notes](#security-notes) and the [Roadmap](#roadmap--what-a-production-deployment-would-add). It also ships no model: real work comes from a `Provider` you write, or the optional `media` extra.
 
+### Why not Celery or Hatchet?
+
+[Celery](https://github.com/celery/celery) is a distributed task queue: workers pull jobs from a broker such as Redis or RabbitMQ. [Hatchet](https://github.com/hatchet-dev/hatchet) is a Postgres-backed engine for background tasks and durable workflows, with retries, a web UI and SDKs for Python, TypeScript, Go and Ruby.
+
+Use one of them when you need to *execute* jobs at scale: many workers, many processes, retries, durable state. This repo is not that. Its queue is in-process and its store is single-writer.
+
+What this repo gives you is the *public HTTP contract* in front of the work: `POST` returns `{id, polling_url}`, `GET` reports status, and `expired` is a real status. It adds restart-safe idempotency keys and SSRF-guarded, signed webhooks. A `Provider` is one `run()` method, so it can hand jobs to Celery or Hatchet while callers keep the same API.
+
 ## The contract
 
 A provider-agnostic, self-hostable reference implementation of the async job contract independently converged on by [fal.ai](https://fal.ai), [Black Forest Labs' own hosted API](https://bfl.ai), and RunPod's [`worker-comfyui`](https://github.com/runpod-workers/worker-comfyui):
