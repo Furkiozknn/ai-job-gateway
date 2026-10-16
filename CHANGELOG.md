@@ -6,6 +6,19 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- `gateway_poll.parse_submission` no longer uses `assert` (skipped under
+  `python -O`) or a bare `KeyError` to validate a successful submission
+  response. It raises the new `GatewayContractError` (a `ValueError`),
+  naming the missing field. `JobGatewayClient.submit()` turns it, and a
+  non-JSON 2xx body, into `JobSubmissionError`.
+
+### Added
+- Bounded poll retry: `JobHandle.poll()` retries a network error or a
+  502/503/504 up to three times with backoff (0.5 s, 1 s, 2 s). The policy
+  (`is_transient_poll_status`, `poll_retry_delays`) is in `gateway_poll.py`,
+  so the vendored copies share it.
+
 ### Changed
 - An `Idempotency-Key` reused with a different request (capability, params
   or `webhook_url`) is now rejected with `422` instead of silently returning

@@ -27,10 +27,13 @@ from .exceptions import (
     JobSubmissionError,
 )
 from .gateway_poll import (
+    GatewayContractError,
     GatewayHTTPError,
     expired_detail,
     is_expired_poll_response,
+    is_transient_poll_status,
     parse_submission,
+    poll_retry_delays,
     resolve_polling_url,
     submit_url,
 )
@@ -45,9 +48,26 @@ class JobHandle:
         self.polling_url = polling_url
 
     async def poll(self) -> dict[str, Any]:
-        """One GET against the polling URL. Returns the raw job record dict."""
+        """One poll of the job. Returns the raw job record dict.
+
+        A network error or a 502/503/504 is retried a bounded number of
+        times with backoff (``gateway_poll.poll_retry_delays``) before it is
+        raised: a GET of the polling URL is safe to repeat, and one blip
+        should not fail a ``wait()`` that has minutes left.
+        """
         url = resolve_polling_url(self._client._base_url, self.polling_url)
-        response = await self._client._http.get(url, headers=self._client._auth_headers)
+        delays = poll_retry_delays()
+        for attempt in range(len(delays) + 1):
+            last = attempt == len(delays)
+            try:
+                response = await self._client._http.get(url, headers=self._client._auth_headers)
+            except httpx.TransportError:
+                if last:
+                    raise
+            else:
+                if last or not is_transient_poll_status(response.status_code):
+                    break
+            await asyncio.sleep(delays[attempt])
         if response.status_code == 404:
             raise JobNotFoundError(self.job_id)
         if is_expired_poll_response(response.status_code):
@@ -124,11 +144,18 @@ class JobGatewayClient:
         response = await self._http.post(
             submit_url(self._base_url, capability), json=body, headers=headers
         )
-        body_json = response.json() if response.status_code < 400 else None
+        body_json = None
+        if response.status_code < 400:
+            try:
+                body_json = response.json()
+            except ValueError:
+                body_json = None  # parse_submission reports it as not a JSON object
         try:
             job_id, polling_url = parse_submission(response.status_code, body_json, response.text)
         except GatewayHTTPError as exc:
             raise JobSubmissionError(exc.status_code, exc.body_text) from exc
+        except GatewayContractError as exc:
+            raise JobSubmissionError(exc.status_code, f"{exc.reason}: {exc.body_text}") from exc
         return JobHandle(self, job_id, polling_url)
 
     async def aclose(self) -> None:
