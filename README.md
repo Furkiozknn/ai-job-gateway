@@ -45,6 +45,14 @@ Use it when you are putting a slow generative backend (image, video, lip-sync, a
 
 Do not use it as a multi-tenant public service: there is one shared API key, no per-caller identity, no rate limiting, no purge of finished jobs, and the queue is in-process (one server process; SQLite is single-writer). See [Security notes](#security-notes) and the [Roadmap](#roadmap--what-a-production-deployment-would-add). It also ships no model: real work comes from a `Provider` you write, or the optional `media` extra.
 
+### Why not Celery or Hatchet?
+
+[Celery](https://github.com/celery/celery) is a distributed task queue: workers pull jobs from a broker such as Redis or RabbitMQ. [Hatchet](https://github.com/hatchet-dev/hatchet) is a Postgres-backed engine for background tasks and durable workflows, with retries, a web UI and SDKs for Python, TypeScript, Go and Ruby.
+
+Use one of them when you need to *execute* jobs at scale: many workers, many processes, retries, durable state. This repo is not that. Its queue is in-process and its store is single-writer.
+
+What this repo gives you is the *public HTTP contract* in front of the work: `POST` returns `{id, polling_url}`, `GET` reports status, and `expired` is a real status. It adds restart-safe idempotency keys and SSRF-guarded, signed webhooks. A `Provider` is one `run()` method, so it can hand jobs to Celery or Hatchet while callers keep the same API.
+
 ## The contract
 
 A provider-agnostic, self-hostable reference implementation of the async job contract independently converged on by [fal.ai](https://fal.ai), [Black Forest Labs' own hosted API](https://bfl.ai), and RunPod's [`worker-comfyui`](https://github.com/runpod-workers/worker-comfyui):
@@ -255,11 +263,44 @@ curl -X POST http://127.0.0.1:8000/v1/mock-generate \
   -d '{"prompt": "a cat"}'
 ```
 
+A retry has to be the *same* request. The gateway stores a fingerprint of each keyed submission (SHA-256 over the canonical JSON of the capability, the params and `webhook_url`; key order and whitespace do not matter), and a key reused with a different request gets `422` instead of the unrelated original job. This is what Stripe does, and what the IETF [Idempotency-Key draft](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/) recommends:
+
+```console
+$ curl -s -X POST http://127.0.0.1:8000/v1/mock-generate -H 'Idempotency-Key: order-4711' -d '{"prompt": "a dog"}'
+{"detail":"Idempotency-Key 'order-4711' was already used for a different request (capability, params or webhook_url); use a new key for a new request"}
+```
+
 Keys are at most 255 characters (longer is a `422`). The dedupe window is bounded to the 10,000 most recent keys and lives in the job store: with `SQLiteJobStore` it **survives a restart** — a deploy mid-request is exactly when a lost response gets retried, so restart-volatile dedupe would fail at the moment it matters (with `InMemoryJobStore` it is as volatile as the jobs themselves). Omit the header and every submission is independent, exactly as before.
 
 ### Restart recovery
 
 Background tasks die with the process, so a job still `pending`/`processing` in a persistent store at startup has nothing driving it anymore. On startup the server sweeps these and marks each `error` with an explicit "interrupted by a gateway restart; submit the job again" message (and fires its webhook, if any) instead of letting it read `processing` forever. Providers are deliberately **not** re-run automatically — whether a half-finished generation's side effects are safe to repeat is the caller's decision, made by resubmitting with a fresh idempotency key. The sweep also re-fires webhooks for jobs that finished but whose delivery outcome was never recorded (`webhook_status` still null) — the previous process died mid-delivery and the receiver may never have heard. Delivery is therefore **at-least-once**: a crash landing after the receiver's 2xx but before the outcome was recorded produces a duplicate on the next startup, so receivers should dedupe on the job `id`. And because the sweep treats every pending/processing row as ownerless, it assumes a **single gateway process** — starting a second process over the same SQLite file would fail the first one's live jobs (one more reason multi-process wants Postgres, per Limitations).
+
+### Cancelling a job
+
+`POST /v1/jobs/{id}/cancel` stops a job that is still `pending` or `processing`. A pending job never starts. A running provider has its task cancelled, so `CancelledError` is raised inside `Provider.run()` and an `async with` around an upstream request closes it. fal.ai's queue API (`PUT .../requests/{id}/cancel`), Celery's `revoke` and Temporal/Hatchet cancellation all offer the same operation; without it, a caller who no longer wants a 10-minute video job can only wait for it and pay for it.
+
+```console
+$ ai-job-gateway cancel 737d39987cbc4f0b9f466fb2664cb77f
+{
+  "id": "737d39987cbc4f0b9f466fb2664cb77f",
+  "capability": "mock-generate",
+  "status": "error",
+  "error": "cancelled by the caller before it finished",
+  "result_expires_at": "2026-10-15T10:08:47.809809Z",
+  ...
+}
+$ ai-job-gateway cancel 7bc1c0f5981a49f8bbd6fdcf6443c4d5     # an echo job that already finished
+error: job '7bc1c0f5981a49f8bbd6fdcf6443c4d5' already finished (ready) and cannot be cancelled
+```
+
+<sub>Real output against `ai-job-gateway serve`, shortened where marked `...`. The second command exits 1.</sub>
+
+- **The contract does not change.** A cancelled job reads `error`, so every poller that treats `error` as terminal (including the vendored `gateway_poll.py` in the other repositories) stops polling without an update. The `error` text is always exactly `cancelled by the caller before it finished` (`ai_job_gateway.manager.CANCELLED_ERROR`); that string is how a caller tells a cancellation from a failure.
+- **Answers:** `200` with the cancelled record, `409` when the job already finished (`ready`, `error` or `expired`: its outcome is final and its webhook may already be on its way), `404` for an unknown id, `401` without the key when `AJG_API_KEY` is set. Cancelling a cancelled job again returns the same record.
+- **The webhook fires** for a cancelled job like for any other terminal transition, once.
+- **A provider that ignores the cancellation** (catches `CancelledError` and keeps going) gets 5 seconds (`CANCEL_GRACE_SECONDS`). After that the job is recorded as cancelled anyway, and whatever the provider returns later is discarded instead of being written over the cancellation.
+- Python: `await client.cancel(job_id)` or `await handle.cancel()` returns the record and raises `JobNotCancellableError` on `409`. In-process: `await manager.cancel(job_id)`.
 
 ### Operability
 
@@ -316,6 +357,8 @@ asyncio.run(main())
 ```
 
 `handle.wait()` raises `JobFailedError` on an `error` status, `JobExpiredError` if the result expires before you fetch it, and plain `TimeoutError` if your `timeout` elapses first.
+
+Each poll retries a network error or a `502`/`503`/`504` up to three times, after 0.5 s, 1 s and 2 s, before raising it. The schedule lives in the vendored `gateway_poll.py`, so the other repositories retry the same way. A successful submission whose body is not the documented `{id, polling_url}` object raises `JobSubmissionError` with the reason, not a `KeyError`.
 
 ## Development
 
