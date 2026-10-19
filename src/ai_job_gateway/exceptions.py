@@ -11,6 +11,21 @@ class UnknownCapabilityError(Exception):
         super().__init__(f"unknown capability: {capability!r}")
 
 
+class IdempotencyKeyReusedError(Exception):
+    """Raised by JobManager.submit() when an idempotency key that already led
+    to a job arrives with a different request (capability, params or
+    webhook_url). Returning the original job would silently answer a request
+    the caller never made; the server maps this to HTTP 422."""
+
+    def __init__(self, idempotency_key: str, job_id: str) -> None:
+        self.idempotency_key = idempotency_key
+        self.job_id = job_id
+        super().__init__(
+            f"Idempotency-Key {idempotency_key!r} was already used for a different "
+            "request (capability, params or webhook_url); use a new key for a new request"
+        )
+
+
 class JobNotFoundError(Exception):
     """Raised by the client when a job id doesn't exist on the server."""
 
@@ -34,3 +49,21 @@ class JobSubmissionError(Exception):
         self.status_code = status_code
         self.message = message
         super().__init__(f"submission rejected ({status_code}): {message}")
+
+
+class JobNotCancellableError(Exception):
+    """Raised when cancelling a job that already finished.
+
+    ``JobManager.cancel()`` raises it for a ready, error or expired job (the
+    server maps it to HTTP 409), and the client raises it when the server
+    answers 409. A finished job's outcome is final: its webhook may already
+    have been delivered."""
+
+    def __init__(self, job_id: str, status: str, detail: str | None = None) -> None:
+        self.job_id = job_id
+        #: The job's status when the cancel arrived ("ready", "error",
+        #: "expired"), or "finished" when only the server knows which.
+        self.status = status
+        super().__init__(
+            detail or f"job {job_id!r} already finished ({status}) and cannot be cancelled"
+        )

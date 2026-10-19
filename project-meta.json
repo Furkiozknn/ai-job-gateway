@@ -35,7 +35,7 @@
     "ssrf-protection",
     "webhooks"
   ],
-  "summary": "The async job contract fal.ai, Black Forest Labs and RunPod each arrived at independently, as one hardened reference server: submit, poll, webhook. Idempotency keys that survive a restart, SSRF-guarded signed webhooks, and expiry as a status you can read rather than a silent 404. 204 tests.",
+  "summary": "Provider-agnostic reference server and Python client for the async AI job contract - submit, poll, webhook - with restart-safe idempotency keys and SSRF-guarded signed webhooks.",
   "key_features": [
     "The async job contract fal.ai, Black Forest Labs and RunPod each arrived at independently, as one hardened reference server: submit, poll, webhook",
     "Idempotency keys that survive a restart",

@@ -115,6 +115,33 @@ def _submit(args: argparse.Namespace) -> None:
         raise SystemExit(f"error: {exc}. The job is still running on the server; raise --timeout to wait longer.")
 
 
+def _cancel(args: argparse.Namespace) -> None:
+    import httpx
+
+    from .client import JobGatewayClient
+    from .exceptions import JobNotCancellableError, JobNotFoundError
+
+    async def run() -> None:
+        async with JobGatewayClient(
+            args.url, api_key=os.environ.get("AJG_API_KEY") or None
+        ) as client:
+            record = await client.cancel(args.job_id)
+            print(json.dumps(record, indent=2))
+
+    try:
+        asyncio.run(run())
+    except httpx.TransportError as exc:
+        raise SystemExit(
+            f"error: cannot reach a gateway at {args.url} ({type(exc).__name__}). "
+            "Start one in another terminal with: ai-job-gateway serve"
+        )
+    except httpx.HTTPStatusError as exc:
+        hint = "; set AJG_API_KEY in this shell" if exc.response.status_code == 401 else ""
+        raise SystemExit(f"error: the gateway answered HTTP {exc.response.status_code}{hint}")
+    except (JobNotCancellableError, JobNotFoundError) as exc:
+        raise SystemExit(f"error: {exc}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="ai-job-gateway",
@@ -209,6 +236,19 @@ def main() -> None:
         "--timeout", type=float, default=60.0, help="seconds to wait for the result (default: %(default)s)"
     )
     submit_parser.set_defaults(func=_submit)
+
+    cancel_parser = subparsers.add_parser(
+        "cancel",
+        help="cancel a pending or processing job on a running server",
+        description="Stop one job and print its cancelled record as JSON. Exit 0 when the "
+        "job is cancelled (or already was), 1 when it already finished or does not exist.",
+        epilog="example: ai-job-gateway cancel fe738f30cbb44c88ac429382e40c4498",
+    )
+    cancel_parser.add_argument("job_id", help="the id POST /v1/{capability} returned")
+    cancel_parser.add_argument(
+        "--url", default="http://127.0.0.1:8000", help="gateway address (default: %(default)s)"
+    )
+    cancel_parser.set_defaults(func=_cancel)
 
     args = parser.parse_args()
     args.func(args)

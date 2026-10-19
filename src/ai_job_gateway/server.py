@@ -4,8 +4,10 @@
 
     POST /v1/{capability}   -> 202 {"id": ..., "polling_url": "/v1/jobs/{id}"}
     GET  /v1/jobs/{id}      -> the job record (200 while pending/processing/ready/error, 410 once expired, 404 if unknown)
+    POST /v1/jobs/{id}/cancel -> the cancelled record (409 if it already finished, 404 if unknown)
     GET  /v1/capabilities   -> {capability: provider_name, ...}
     GET  /health            -> {"status": "ok"} -- liveness probe, no dependency on the store
+    GET  /metrics           -> Prometheus text format (needs the key when AJG_API_KEY is set)
 
 This is the same shape independently converged on by fal.ai/BFL/RunPod's
 worker-comfyui -- submit returns immediately, the caller polls (or gets a
@@ -28,12 +30,16 @@ from typing import Optional, Any
 from urllib.parse import urlsplit
 
 from fastapi import Query, FastAPI, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 
+from .metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
+
 from . import netguard
-from .exceptions import UnknownCapabilityError
+from .exceptions import IdempotencyKeyReusedError, UnknownCapabilityError
 from .manager import JobManager
 from .models import JobRecord, JobStatus
+from .exceptions import JobNotCancellableError, JobNotFoundError
 
 #: Default cap on a submission's raw request body. FastAPI/Starlette place no
 #: limit on body size by default -- `await request.json()` happily buffers an
@@ -134,8 +140,9 @@ _SUBMIT_OPENAPI: dict[str, Any] = {
             "required": False,
             "schema": {"type": "string", "maxLength": 255},
             "description": (
-                "Resubmitting with a key already used returns the original job's id "
-                "instead of creating a second job."
+                "Resubmitting the same request with a key already used returns the "
+                "original job's id instead of creating a second job. Reusing a key "
+                "with a different request (capability, params or webhook_url) is a 422."
             ),
         }
     ],
@@ -277,7 +284,10 @@ def create_app(
             _401=_UNAUTHORIZED,
             _404="No provider is registered under this capability.",
             _413="Request body exceeds the configured size limit.",
-            _422="Malformed capability name, body, webhook_url or Idempotency-Key.",
+            _422=(
+                "Malformed capability name, body, webhook_url or Idempotency-Key, "
+                "or an Idempotency-Key reused with a different request."
+            ),
         ),
     )
     async def submit(capability: str, request: Request) -> dict[str, str]:
@@ -313,6 +323,8 @@ def create_app(
             )
         except UnknownCapabilityError as exc:
             raise HTTPException(404, str(exc))
+        except IdempotencyKeyReusedError as exc:
+            raise HTTPException(422, str(exc))
 
         return {"id": record.id, "polling_url": f"/v1/jobs/{record.id}"}
 
@@ -333,6 +345,29 @@ def create_app(
             raise HTTPException(404, f"no job with id {job_id!r}")
         if record.status == JobStatus.EXPIRED:
             raise HTTPException(410, record.error or "this job's result has expired")
+        return record.model_dump(mode="json")
+
+    @app.post(
+        "/v1/jobs/{job_id}/cancel",
+        response_model=JobRecord,
+        responses=_errors(
+            _401=_UNAUTHORIZED,
+            _404="No job with this id.",
+            _409="The job already finished (ready, error or expired); nothing to cancel.",
+        ),
+    )
+    async def cancel_job(job_id: str, request: Request) -> dict[str, Any]:
+        """Stop a pending or processing job. Returns the cancelled record:
+        status ``error``, ``error`` set to the fixed cancellation message.
+        A pending job never starts; a running provider has its task
+        cancelled. Cancelling a cancelled job again returns the same record."""
+        _require_api_key(request)
+        try:
+            record = await manager.cancel(job_id)
+        except JobNotFoundError as exc:
+            raise HTTPException(404, str(exc))
+        except JobNotCancellableError as exc:
+            raise HTTPException(409, str(exc))
         return record.model_dump(mode="json")
 
     @app.get("/v1/jobs", responses=_errors(_401=_UNAUTHORIZED))
@@ -401,5 +436,32 @@ def create_app(
         is up and serving requests -- it does not touch the store, so it
         stays meaningful even for a JobStore backend that's degraded."""
         return {"status": "ok"}
+
+    @app.get(
+        "/metrics",
+        response_class=Response,
+        responses={
+            200: {
+                "content": {METRICS_CONTENT_TYPE: {}},
+                "description": "Prometheus text exposition format 0.0.4.",
+            },
+            **_errors(_401=_UNAUTHORIZED),
+        },
+    )
+    async def metrics(request: Request) -> Response:
+        """Prometheus metrics: jobs created, queue wait and provider run
+        time histograms, provider calls in flight, webhook outcomes, and
+        jobs by status. Needs the bearer key when AJG_API_KEY is set, like
+        every /v1 route: it names capabilities and counts traffic. Point a
+        scrape job's ``authorization`` at the same key."""
+        _require_api_key(request)
+        counts = await manager.store.stats()
+        by_status = {s.value: 0 for s in JobStatus}
+        by_status.update(counts["by_status"])
+        body = manager.metrics.render(
+            jobs_by_status=by_status,
+            registered_capabilities=len(manager.registry),
+        )
+        return Response(content=body, media_type=METRICS_CONTENT_TYPE)
 
     return app

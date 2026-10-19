@@ -4,6 +4,50 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- `gateway_poll.parse_submission` no longer uses `assert` (skipped under
+  `python -O`) or a bare `KeyError` to validate a successful submission
+  response. It raises the new `GatewayContractError` (a `ValueError`),
+  naming the missing field. `JobGatewayClient.submit()` turns it, and a
+  non-JSON 2xx body, into `JobSubmissionError`.
+
+### Added
+- Bounded poll retry: `JobHandle.poll()` retries a network error or a
+  502/503/504 up to three times with backoff (0.5 s, 1 s, 2 s). The policy
+  (`is_transient_poll_status`, `poll_retry_delays`) is in `gateway_poll.py`,
+  so the vendored copies share it.
+- Job cancellation: `POST /v1/jobs/{id}/cancel` stops a `pending` or
+  `processing` job (`200` with the record, `409` once the job has finished,
+  `404` for an unknown id). A pending job never starts; a running provider's
+  task is cancelled. The job reads `error` with the fixed message
+  `CANCELLED_ERROR`, so the public status set is unchanged, and its webhook
+  fires once. A provider that ignores the cancellation is recorded as
+  cancelled after `CANCEL_GRACE_SECONDS` (5 s) and its late result is
+  discarded. Also `JobManager.cancel()`, `JobGatewayClient.cancel()`,
+  `JobHandle.cancel()`, `JobGatewayClient.handle(job_id)`, the
+  `JobNotCancellableError` exception and an `ai-job-gateway cancel` command.
+- `GET /metrics` in the Prometheus text format, with no new dependency.
+  It covers jobs created per capability, queue wait and provider run time
+  histograms (the run time split by `ready` / `error` / `cancelled`),
+  provider calls in flight, webhook outcomes, and jobs by status read from
+  the store. It needs the bearer key when `AJG_API_KEY` is set. In Python
+  it is `GatewayMetrics` and `JobManager(metrics=...)`.
+
+### Changed
+- An `Idempotency-Key` reused with a different request (capability, params
+  or `webhook_url`) is now rejected with `422` instead of silently returning
+  the original, unrelated job. A SHA-256 fingerprint of the canonical request
+  JSON is stored with the key (`SQLiteJobStore` adds a `fingerprint` column
+  to an existing database on open). Keys remembered before this change are
+  compared against their original job record. `JobManager.submit()` raises
+  the new `IdempotencyKeyReusedError`; `JobStore` gains two non-abstract
+  methods, `remember_idempotency_fingerprint` and
+  `recall_idempotency_fingerprint`, so custom stores keep working unchanged.
+- The provider call runs as its own asyncio task inside the job's task, so a
+  cancellation stops exactly the provider and never a store write in flight.
+
 ## [0.1.0] - 2026-09-25
 
 First tagged release. Everything below is in it.

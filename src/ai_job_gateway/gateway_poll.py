@@ -19,11 +19,18 @@ mapping. It does NOT cover repo-specific behavior that differs on purpose
 poll -- keep handling that locally in each wrapper, before calling into
 this module).
 
+It also owns the *policy* half of retrying a poll after a transient failure
+(which status codes count as transient, and the bounded backoff schedule),
+so every wrapper retries the same way. The retry loop itself -- catching
+the HTTP client's own network-error type and sleeping -- stays in each
+wrapper, because that is I/O.
+
 Canonical copy: ai-job-gateway/src/ai_job_gateway/gateway_poll.py
-Known copies (keep in sync by hand -- there is no import relationship):
-  - ai-job-gateway/src/ai_job_gateway/client.py
-  - prompt-template-manager/src/prompt_template_manager/gateway_client.py
-  - model-comparison-harness/src/model_comparison_harness/backends.py
+Copies, byte-identical, checked by each repo's arac/vendor-dogrula.py
+(there is no import relationship; re-copy after changing the canonical file):
+  - ai-workflow-engine/src/ai_workflow_engine/gateway_poll.py
+  - model-comparison-harness/src/model_comparison_harness/gateway_poll.py
+  - prompt-template-manager/src/prompt_template_manager/gateway_poll.py
 """
 
 from __future__ import annotations
@@ -41,6 +48,63 @@ class GatewayHTTPError(Exception):
         self.status_code = status_code
         self.body_text = body_text
         super().__init__(f"gateway returned {status_code}: {body_text}")
+
+
+class GatewayContractError(ValueError):
+    """The gateway answered with a success status, but the body does not
+    have the shape the contract promises (not a JSON object, or a required
+    field missing).
+
+    Distinct from GatewayHTTPError on purpose: nothing was rejected, the
+    server is just not speaking the contract. ``field`` names the missing
+    field, or is None when the body is not an object at all.
+    This replaces an ``assert`` (stripped under ``python -O``) and a bare
+    ``KeyError``, neither of which said what was wrong.
+    """
+
+    def __init__(self, status_code: int, body_text: str, field: Optional[str], reason: str) -> None:
+        self.status_code = status_code
+        self.body_text = body_text
+        self.field = field
+        self.reason = reason
+        super().__init__(f"gateway returned {status_code} but {reason}: {body_text}")
+
+
+#: Poll responses worth asking again: the gateway, or a proxy or load
+#: balancer in front of it, is briefly unavailable. A GET of the polling URL
+#: has no side effects, so repeating it is always safe. 500 is deliberately
+#: not here -- it is the gateway reporting its own bug, not a blip.
+TRANSIENT_POLL_STATUS_CODES = frozenset({502, 503, 504})
+
+#: How many times one poll is retried after a transient failure, and the
+#: capped exponential schedule between attempts (0.5 s, 1 s, 2 s by
+#: default: under 4 s in total, so a real outage still surfaces quickly).
+POLL_RETRY_ATTEMPTS = 3
+POLL_RETRY_BASE_SECONDS = 0.5
+POLL_RETRY_CAP_SECONDS = 4.0
+
+
+def is_transient_poll_status(status_code: int) -> bool:
+    """True if a poll response with this status should be retried."""
+    return status_code in TRANSIENT_POLL_STATUS_CODES
+
+
+def poll_retry_delays(
+    attempts: int = POLL_RETRY_ATTEMPTS,
+    *,
+    base: float = POLL_RETRY_BASE_SECONDS,
+    cap: float = POLL_RETRY_CAP_SECONDS,
+) -> list[float]:
+    """The waits before each retry of one poll; ``len()`` is the retry budget.
+
+    A wrapper retries a poll GET that raised its HTTP client's network error,
+    or returned a status for which ``is_transient_poll_status`` is True, at
+    most ``len(delays)`` times, sleeping ``delays[n]`` before retry n, and
+    then lets the last failure through unchanged. Bounded on purpose: one
+    network blip should not fail a whole run, and a dead gateway should not
+    hang it either.
+    """
+    return [min(cap, base * (2**n)) for n in range(max(0, attempts))]
 
 
 @dataclass
@@ -71,10 +135,21 @@ def parse_submission(status_code: int, body_json: Optional[dict], body_text: str
     Returns (job_id, polling_url_path) on success. Raises GatewayHTTPError
     for any status_code >= 400 -- submission rejection has no special case
     analogous to poll's 410, every repo already treats it uniformly.
+    Raises GatewayContractError for a success status whose body is not a
+    JSON object or lacks ``id`` or ``polling_url``. What a valid value looks
+    like (e.g. a same-origin path) is each wrapper's call, as before.
     """
     if status_code >= 400:
         raise GatewayHTTPError(status_code, body_text)
-    assert body_json is not None, "a successful submission response must have a JSON body"
+    if not isinstance(body_json, dict):
+        raise GatewayContractError(
+            status_code, body_text, None, "the submission response is not a JSON object"
+        )
+    for field in ("id", "polling_url"):
+        if field not in body_json:
+            raise GatewayContractError(
+                status_code, body_text, field, f"the submission response is missing {field!r}"
+            )
     return body_json["id"], body_json["polling_url"]
 
 

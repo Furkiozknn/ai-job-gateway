@@ -33,13 +33,16 @@ from __future__ import annotations
 
 from .client import JobGatewayClient, JobHandle
 from .exceptions import (
+    IdempotencyKeyReusedError,
     JobExpiredError,
     JobFailedError,
     JobNotFoundError,
     JobSubmissionError,
     UnknownCapabilityError,
 )
+from .exceptions import JobNotCancellableError
 from .manager import JobManager
+from .metrics import GatewayMetrics
 from .models import JobRecord, JobStatus
 from .providers import EchoProvider, MockProvider, Provider, ProviderError
 from .providers_local import LocalMediaProvider, local_media_registry
@@ -51,12 +54,15 @@ from .webhook_signing import verify_webhook
 __all__ = [
     "JobGatewayClient",
     "JobHandle",
+    "IdempotencyKeyReusedError",
     "JobExpiredError",
     "JobFailedError",
     "JobNotFoundError",
     "JobSubmissionError",
+    "JobNotCancellableError",
     "UnknownCapabilityError",
     "JobManager",
+    "GatewayMetrics",
     "JobRecord",
     "JobStatus",
     "EchoProvider",
