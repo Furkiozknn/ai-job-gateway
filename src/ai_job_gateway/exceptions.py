@@ -11,6 +11,21 @@ class UnknownCapabilityError(Exception):
         super().__init__(f"unknown capability: {capability!r}")
 
 
+class IdempotencyKeyReusedError(Exception):
+    """Raised by JobManager.submit() when an idempotency key that already led
+    to a job arrives with a different request (capability, params or
+    webhook_url). Returning the original job would silently answer a request
+    the caller never made; the server maps this to HTTP 422."""
+
+    def __init__(self, idempotency_key: str, job_id: str) -> None:
+        self.idempotency_key = idempotency_key
+        self.job_id = job_id
+        super().__init__(
+            f"Idempotency-Key {idempotency_key!r} was already used for a different "
+            "request (capability, params or webhook_url); use a new key for a new request"
+        )
+
+
 class JobNotFoundError(Exception):
     """Raised by the client when a job id doesn't exist on the server."""
 

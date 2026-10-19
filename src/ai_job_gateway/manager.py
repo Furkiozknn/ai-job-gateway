@@ -16,6 +16,7 @@ change when that swap happens.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -26,7 +27,7 @@ from typing import Optional
 import httpx
 
 from . import clock
-from .exceptions import UnknownCapabilityError
+from .exceptions import IdempotencyKeyReusedError, UnknownCapabilityError
 from .models import TERMINAL_STATUSES, JobRecord, JobStatus
 from .netguard import WebhookDestinationBlocked, guarded_webhook_client
 from .providers import Provider
@@ -86,6 +87,28 @@ CANCELLED_ERROR = "cancelled by the caller before it finished"
 WEBHOOK_MAX_ATTEMPTS = 5
 WEBHOOK_BACKOFF_BASE_SECONDS = 1.0
 WEBHOOK_BACKOFF_CAP_SECONDS = 30.0
+
+
+def request_fingerprint(capability: str, params: dict, webhook_url: Optional[str]) -> str:
+    """SHA-256 over the canonical JSON of everything a submission asks for.
+
+    Canonical means sorted keys, no insignificant whitespace and UTF-8, so
+    the same request always hashes the same however its JSON was spelled
+    (key order, spacing). Stored next to an idempotency key, it is how a
+    reused key with a *different* request is told apart from a genuine
+    retry: Stripe rejects that case, and the IETF Idempotency-Key draft
+    (draft-ietf-httpapi-idempotency-key-header) recommends a 422.
+    """
+    canonical = json.dumps(
+        {"capability": capability, "params": params, "webhook_url": webhook_url},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        # Over HTTP params are always parsed JSON; a library caller may pass
+        # other values, which should hash stably rather than raise here.
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _webhook_backoff_delays(rng=random.uniform) -> list[float]:
@@ -254,6 +277,12 @@ class JobManager:
         double-running the provider. A key is only ever consumed once it's
         led to a real job; a call that raises ``UnknownCapabilityError``
         leaves the key free to try again.
+
+        A retry must be the *same* request. If the key arrives with a
+        different capability, params or webhook_url, this raises
+        ``IdempotencyKeyReusedError`` (HTTP 422 from the server) rather than
+        returning the original job, which would answer a request the caller
+        never made. Requests are compared by ``request_fingerprint``.
         """
         provider = self.registry.get(capability)
         if provider is None:
@@ -272,6 +301,7 @@ class JobManager:
         # single process (demonstrated in the audit against the SQLite
         # store). The lock table is cleaned up by waiter-count so a stream
         # of unique keys can't grow it without bound.
+        fingerprint = request_fingerprint(capability, params, webhook_url)
         lock = self._submit_key_locks.get(idempotency_key)
         if lock is None:
             lock = self._submit_key_locks[idempotency_key] = asyncio.Lock()
@@ -284,6 +314,16 @@ class JobManager:
                 if existing_id is not None:
                     existing = await self.store.get(existing_id)
                     if existing is not None:
+                        stored = await self.store.recall_idempotency_fingerprint(idempotency_key)
+                        if stored is None:
+                            # A key remembered before fingerprints existed, or
+                            # a custom store that keeps none: the original
+                            # record holds the same three fields, so hash it.
+                            stored = request_fingerprint(
+                                existing.capability, existing.params, existing.webhook_url
+                            )
+                        if stored != fingerprint:
+                            raise IdempotencyKeyReusedError(idempotency_key, existing.id)
                         return existing
                     # The original record is gone (e.g. evicted from an
                     # in-memory store some other way) -- fall through and
@@ -302,8 +342,12 @@ class JobManager:
                 # opposite window: record created, key not yet remembered,
                 # so the client's retry double-ran the provider -- the
                 # exact failure this feature exists to prevent.
+                #
+                # The fingerprint goes in right after the key and before the
+                # record, so the "no record yet" window above covers it too.
                 record = self._new_record(capability, provider, params, webhook_url)
                 await self.store.remember_idempotency_key(idempotency_key, record.id)
+                await self.store.remember_idempotency_fingerprint(idempotency_key, fingerprint)
                 await self.store.create(record)
                 self._schedule(record, provider, params)
                 return record

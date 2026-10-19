@@ -45,6 +45,14 @@ Use it when you are putting a slow generative backend (image, video, lip-sync, a
 
 Do not use it as a multi-tenant public service: there is one shared API key, no per-caller identity, no rate limiting, no purge of finished jobs, and the queue is in-process (one server process; SQLite is single-writer). See [Security notes](#security-notes) and the [Roadmap](#roadmap--what-a-production-deployment-would-add). It also ships no model: real work comes from a `Provider` you write, or the optional `media` extra.
 
+### Why not Celery or Hatchet?
+
+[Celery](https://github.com/celery/celery) is a distributed task queue: workers pull jobs from a broker such as Redis or RabbitMQ. [Hatchet](https://github.com/hatchet-dev/hatchet) is a Postgres-backed engine for background tasks and durable workflows, with retries, a web UI and SDKs for Python, TypeScript, Go and Ruby.
+
+Use one of them when you need to *execute* jobs at scale: many workers, many processes, retries, durable state. This repo is not that. Its queue is in-process and its store is single-writer.
+
+What this repo gives you is the *public HTTP contract* in front of the work: `POST` returns `{id, polling_url}`, `GET` reports status, and `expired` is a real status. It adds restart-safe idempotency keys and SSRF-guarded, signed webhooks. A `Provider` is one `run()` method, so it can hand jobs to Celery or Hatchet while callers keep the same API.
+
 ## The contract
 
 A provider-agnostic, self-hostable reference implementation of the async job contract independently converged on by [fal.ai](https://fal.ai), [Black Forest Labs' own hosted API](https://bfl.ai), and RunPod's [`worker-comfyui`](https://github.com/runpod-workers/worker-comfyui):
@@ -255,6 +263,13 @@ curl -X POST http://127.0.0.1:8000/v1/mock-generate \
   -d '{"prompt": "a cat"}'
 ```
 
+A retry has to be the *same* request. The gateway stores a fingerprint of each keyed submission (SHA-256 over the canonical JSON of the capability, the params and `webhook_url`; key order and whitespace do not matter), and a key reused with a different request gets `422` instead of the unrelated original job. This is what Stripe does, and what the IETF [Idempotency-Key draft](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/) recommends:
+
+```console
+$ curl -s -X POST http://127.0.0.1:8000/v1/mock-generate -H 'Idempotency-Key: order-4711' -d '{"prompt": "a dog"}'
+{"detail":"Idempotency-Key 'order-4711' was already used for a different request (capability, params or webhook_url); use a new key for a new request"}
+```
+
 Keys are at most 255 characters (longer is a `422`). The dedupe window is bounded to the 10,000 most recent keys and lives in the job store: with `SQLiteJobStore` it **survives a restart** — a deploy mid-request is exactly when a lost response gets retried, so restart-volatile dedupe would fail at the moment it matters (with `InMemoryJobStore` it is as volatile as the jobs themselves). Omit the header and every submission is independent, exactly as before.
 
 ### Restart recovery
@@ -311,6 +326,8 @@ asyncio.run(main())
 ```
 
 `handle.wait()` raises `JobFailedError` on an `error` status, `JobExpiredError` if the result expires before you fetch it, and plain `TimeoutError` if your `timeout` elapses first.
+
+Each poll retries a network error or a `502`/`503`/`504` up to three times, after 0.5 s, 1 s and 2 s, before raising it. The schedule lives in the vendored `gateway_poll.py`, so the other repositories retry the same way. A successful submission whose body is not the documented `{id, polling_url}` object raises `JobSubmissionError` with the reason, not a `KeyError`.
 
 ## Development
 
