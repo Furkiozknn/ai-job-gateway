@@ -1,7 +1,8 @@
 """Command-line entry point.
 
-``ai-job-gateway serve`` runs the reference server with the demo registry
-(``mock-generate``, ``echo``). ``ai-job-gateway submit`` is a thin convenience
+``ai-job-gateway serve`` runs the reference server with the default registry
+(``mock-generate``, ``echo``, ``generate-image``, and ``media-*`` when the
+``media`` extra is installed). ``ai-job-gateway submit`` is a thin convenience
 for a quick manual check against a running server -- not the main deliverable,
 just a fast way to poke at things without writing a Python script.
 """

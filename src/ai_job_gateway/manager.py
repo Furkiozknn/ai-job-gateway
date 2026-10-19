@@ -214,7 +214,8 @@ class JobManager:
         injected - paid the connection setup (TCP, and TLS for an https
         receiver) on every webhook and threw the pool away afterwards. One
         client per manager keeps connections alive across deliveries; the
-        retry loop's three attempts to the same receiver reuse one socket.
+        retry loop's attempts (``WEBHOOK_MAX_ATTEMPTS``) to the same receiver
+        reuse one socket.
         """
         if self._http_client is None:
             self._http_client = (

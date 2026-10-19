@@ -59,7 +59,8 @@ A provider-agnostic, self-hostable reference implementation of the async job con
 
 ```
 POST /v1/{capability}   ->  202 { "id": "...", "polling_url": "/v1/jobs/{id}" }
-GET  {polling_url}      ->  { "status": "pending"|"processing"|"ready"|"error"|"expired", "result": {...}?, "error": "..."? }
+GET  {polling_url}      ->  { "status": "pending"|"processing"|"ready"|"error", "result": {...}?, "error": "..."? }
+                            410 { "detail": "..." } once the result window has passed (expired)
 ```
 
 Submit a job, get an id back immediately, poll (or get a webhook) until it's done. That's the whole public contract, for *any* generative model — image, video, lip-sync, whatever a `Provider` wraps.
