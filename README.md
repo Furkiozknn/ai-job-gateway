@@ -276,6 +276,32 @@ Keys are at most 255 characters (longer is a `422`). The dedupe window is bounde
 
 Background tasks die with the process, so a job still `pending`/`processing` in a persistent store at startup has nothing driving it anymore. On startup the server sweeps these and marks each `error` with an explicit "interrupted by a gateway restart; submit the job again" message (and fires its webhook, if any) instead of letting it read `processing` forever. Providers are deliberately **not** re-run automatically — whether a half-finished generation's side effects are safe to repeat is the caller's decision, made by resubmitting with a fresh idempotency key. The sweep also re-fires webhooks for jobs that finished but whose delivery outcome was never recorded (`webhook_status` still null) — the previous process died mid-delivery and the receiver may never have heard. Delivery is therefore **at-least-once**: a crash landing after the receiver's 2xx but before the outcome was recorded produces a duplicate on the next startup, so receivers should dedupe on the job `id`. And because the sweep treats every pending/processing row as ownerless, it assumes a **single gateway process** — starting a second process over the same SQLite file would fail the first one's live jobs (one more reason multi-process wants Postgres, per Limitations).
 
+### Cancelling a job
+
+`POST /v1/jobs/{id}/cancel` stops a job that is still `pending` or `processing`. A pending job never starts. A running provider has its task cancelled, so `CancelledError` is raised inside `Provider.run()` and an `async with` around an upstream request closes it. fal.ai's queue API (`PUT .../requests/{id}/cancel`), Celery's `revoke` and Temporal/Hatchet cancellation all offer the same operation; without it, a caller who no longer wants a 10-minute video job can only wait for it and pay for it.
+
+```console
+$ ai-job-gateway cancel 737d39987cbc4f0b9f466fb2664cb77f
+{
+  "id": "737d39987cbc4f0b9f466fb2664cb77f",
+  "capability": "mock-generate",
+  "status": "error",
+  "error": "cancelled by the caller before it finished",
+  "result_expires_at": "2026-10-15T10:08:47.809809Z",
+  ...
+}
+$ ai-job-gateway cancel 7bc1c0f5981a49f8bbd6fdcf6443c4d5     # an echo job that already finished
+error: job '7bc1c0f5981a49f8bbd6fdcf6443c4d5' already finished (ready) and cannot be cancelled
+```
+
+<sub>Real output against `ai-job-gateway serve`, shortened where marked `...`. The second command exits 1.</sub>
+
+- **The contract does not change.** A cancelled job reads `error`, so every poller that treats `error` as terminal (including the vendored `gateway_poll.py` in the other repositories) stops polling without an update. The `error` text is always exactly `cancelled by the caller before it finished` (`ai_job_gateway.manager.CANCELLED_ERROR`); that string is how a caller tells a cancellation from a failure.
+- **Answers:** `200` with the cancelled record, `409` when the job already finished (`ready`, `error` or `expired`: its outcome is final and its webhook may already be on its way), `404` for an unknown id, `401` without the key when `AJG_API_KEY` is set. Cancelling a cancelled job again returns the same record.
+- **The webhook fires** for a cancelled job like for any other terminal transition, once.
+- **A provider that ignores the cancellation** (catches `CancelledError` and keeps going) gets 5 seconds (`CANCEL_GRACE_SECONDS`). After that the job is recorded as cancelled anyway, and whatever the provider returns later is discarded instead of being written over the cancellation.
+- Python: `await client.cancel(job_id)` or `await handle.cancel()` returns the record and raises `JobNotCancellableError` on `409`. In-process: `await manager.cancel(job_id)`.
+
 ### Operability
 
 `GET /v1/jobs?status=ready&capability=generate-image&limit=50` lists recent jobs newest first, filtered by either or both, and `GET /v1/stats` returns counts by status and by capability — the two things an operator glances at to see whether the queue is draining or one provider is failing. Filtering, sorting, the limit and the counts run inside the store (as SQL queries for `SQLiteJobStore`), so polling these endpoints doesn't scan every job ever created.

@@ -40,6 +40,7 @@ from .exceptions import (
     JobSubmissionError,
     UnknownCapabilityError,
 )
+from .exceptions import JobNotCancellableError
 from .manager import JobManager
 from .models import JobRecord, JobStatus
 from .providers import EchoProvider, MockProvider, Provider, ProviderError
@@ -57,6 +58,7 @@ __all__ = [
     "JobFailedError",
     "JobNotFoundError",
     "JobSubmissionError",
+    "JobNotCancellableError",
     "UnknownCapabilityError",
     "JobManager",
     "JobRecord",

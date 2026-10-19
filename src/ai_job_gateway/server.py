@@ -4,6 +4,7 @@
 
     POST /v1/{capability}   -> 202 {"id": ..., "polling_url": "/v1/jobs/{id}"}
     GET  /v1/jobs/{id}      -> the job record (200 while pending/processing/ready/error, 410 once expired, 404 if unknown)
+    POST /v1/jobs/{id}/cancel -> the cancelled record (409 if it already finished, 404 if unknown)
     GET  /v1/capabilities   -> {capability: provider_name, ...}
     GET  /health            -> {"status": "ok"} -- liveness probe, no dependency on the store
 
@@ -34,6 +35,7 @@ from . import netguard
 from .exceptions import IdempotencyKeyReusedError, UnknownCapabilityError
 from .manager import JobManager
 from .models import JobRecord, JobStatus
+from .exceptions import JobNotCancellableError, JobNotFoundError
 
 #: Default cap on a submission's raw request body. FastAPI/Starlette place no
 #: limit on body size by default -- `await request.json()` happily buffers an
@@ -339,6 +341,29 @@ def create_app(
             raise HTTPException(404, f"no job with id {job_id!r}")
         if record.status == JobStatus.EXPIRED:
             raise HTTPException(410, record.error or "this job's result has expired")
+        return record.model_dump(mode="json")
+
+    @app.post(
+        "/v1/jobs/{job_id}/cancel",
+        response_model=JobRecord,
+        responses=_errors(
+            _401=_UNAUTHORIZED,
+            _404="No job with this id.",
+            _409="The job already finished (ready, error or expired); nothing to cancel.",
+        ),
+    )
+    async def cancel_job(job_id: str, request: Request) -> dict[str, Any]:
+        """Stop a pending or processing job. Returns the cancelled record:
+        status ``error``, ``error`` set to the fixed cancellation message.
+        A pending job never starts; a running provider has its task
+        cancelled. Cancelling a cancelled job again returns the same record."""
+        _require_api_key(request)
+        try:
+            record = await manager.cancel(job_id)
+        except JobNotFoundError as exc:
+            raise HTTPException(404, str(exc))
+        except JobNotCancellableError as exc:
+            raise HTTPException(409, str(exc))
         return record.model_dump(mode="json")
 
     @app.get("/v1/jobs", responses=_errors(_401=_UNAUTHORIZED))

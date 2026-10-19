@@ -32,6 +32,7 @@ from .models import TERMINAL_STATUSES, JobRecord, JobStatus
 from .netguard import WebhookDestinationBlocked, guarded_webhook_client
 from .providers import Provider
 from .store import JobStore
+from .exceptions import JobNotCancellableError, JobNotFoundError
 from .webhook_signing import WEBHOOK_SIGNATURE_HEADER, signature_headers  # noqa: F401 (re-export)
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,19 @@ DEFAULT_WEBHOOK_CONCURRENCY = 10
 #: historical behaviour for everything -- but it is now logged rather than
 #: silent.
 DEFAULT_SHUTDOWN_DRAIN_SECONDS = 10.0
+
+#: How long ``cancel()`` waits for a cancelled provider run to unwind before
+#: it records the cancellation anyway. A provider that swallows
+#: ``CancelledError`` and keeps going cannot hold the caller hostage: the job
+#: is recorded as cancelled after this grace period, and whatever the
+#: provider returns later is discarded instead of overwriting that record.
+CANCEL_GRACE_SECONDS = 5.0
+
+#: The ``error`` text of a job stopped through ``JobManager.cancel()``. A
+#: cancelled job keeps the public contract's statuses (it reads ``error``, so
+#: every poller that already treats ``error`` as terminal stops polling);
+#: this exact string is how a caller tells a cancellation from a failure.
+CANCELLED_ERROR = "cancelled by the caller before it finished"
 
 WEBHOOK_MAX_ATTEMPTS = 5
 WEBHOOK_BACKOFF_BASE_SECONDS = 1.0
@@ -171,6 +185,18 @@ class JobManager:
         # Serializing per key (never globally) closes it for every store.
         self._submit_key_locks: dict[str, asyncio.Lock] = {}
         self._submit_key_waiters: dict[str, int] = {}
+        # Cancellation bookkeeping (see cancel()). _active_jobs holds an
+        # Event for every job whose run phase (slot wait plus provider call)
+        # is still going; it is set the moment that phase ends, so "can this
+        # still be cancelled?" is a synchronous lookup, never a stale store
+        # read. _cancel_targets is the one awaitable that is safe to cancel
+        # right now -- the slot wait or the provider's own task, never a
+        # store write in flight. _cancelling maps a job being cancelled to a
+        # future of its recorded record, so a second cancel() waits on the
+        # first instead of racing it.
+        self._active_jobs: dict[str, asyncio.Event] = {}
+        self._cancel_targets: dict[str, asyncio.Future] = {}
+        self._cancelling: dict[str, asyncio.Future] = {}
         # Keeps a strong reference to in-flight background tasks -- asyncio
         # only weakly holds tasks created with create_task, so without this a
         # task can be garbage-collected mid-run.
@@ -354,20 +380,51 @@ class JobManager:
         return record
 
     def _schedule(self, record: JobRecord, provider: Provider, params: dict) -> None:
+        # Registered before the task exists, so a cancel() that arrives
+        # before the task's first step still finds the job cancellable.
+        self._active_jobs[record.id] = asyncio.Event()
         task = asyncio.create_task(self._run(record.id, provider, params))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
     async def _run(self, job_id: str, provider: Provider, params: dict) -> None:
         try:
-            if self._job_slots is not None:
-                # The job stays honestly "pending" while it queues for a
-                # slot; "processing" is only ever written once the provider
-                # is actually about to run.
-                async with self._job_slots:
+            try:
+                if self._job_slots is not None:
+                    # The job stays honestly "pending" while it queues for a
+                    # slot; "processing" is only ever written once the
+                    # provider is actually about to run. The slot wait is
+                    # the one moment this task itself is safe to cancel.
+                    self._cancel_targets[job_id] = asyncio.current_task()
+                    try:
+                        await self._job_slots.acquire()
+                    finally:
+                        self._cancel_targets.pop(job_id, None)
+                    try:
+                        record = await self._execute(job_id, provider, params)
+                    finally:
+                        self._job_slots.release()
+                else:
                     record = await self._execute(job_id, provider, params)
-            else:
-                record = await self._execute(job_id, provider, params)
+            finally:
+                # The run phase is over (finished, failed or cancelled): from
+                # here on the job is no longer cancellable.
+                active = self._active_jobs.pop(job_id, None)
+                if active is not None:
+                    active.set()
+                pending_cancel = self._cancelling.get(job_id)
+                if pending_cancel is not None and pending_cancel.done():
+                    # cancel() already recorded the outcome (its grace period
+                    # ran out before this provider let go); nothing else will
+                    # look this entry up.
+                    del self._cancelling[job_id]
+        except asyncio.CancelledError:
+            if job_id in self._cancelling:
+                # Cancelled through cancel(), which records the outcome and
+                # fires the webhook itself. Anything else (shutdown) is a
+                # real cancellation and must propagate.
+                return
+            raise
         except Exception:  # noqa: BLE001 - deliberately broad: a failure in
             # the *store* itself (e.g. the update_status(PROCESSING) call
             # above, or the update_status(ERROR) call in the inner except
@@ -396,25 +453,56 @@ class JobManager:
                     job_id,
                 )
                 return
+        if record is None:
+            # Cancelled: cancel() owns the terminal record and its webhook.
+            return
         await self._deliver_webhook(record)
 
-    async def _execute(self, job_id: str, provider: Provider, params: dict) -> JobRecord:
+    async def _execute(
+        self, job_id: str, provider: Provider, params: dict
+    ) -> Optional[JobRecord]:
         """Run the provider and record the terminal status; returns the record.
 
         Error records carry a ``result_expires_at`` just like ready ones do:
         before they did, an errored job was the one kind of record that
         never even reached ``expired``, so a store accumulated them forever
         with nothing marking them as stale (audit finding).
+
+        Returns None, writing nothing, when the job was cancelled through
+        ``cancel()``: that call records the cancellation, and a provider that
+        finishes (or fails) after being asked to stop must not overwrite it.
         """
         await self.store.update_status(job_id, status=JobStatus.PROCESSING)
+        if job_id in self._cancelling:
+            # Cancelled while the PROCESSING write was in flight: never start
+            # the provider at all.
+            return None
+        # The provider runs as its own task so that cancel() can stop exactly
+        # the provider call. Cancelling this whole task instead could land in
+        # the middle of a store write, which for SQLiteJobStore keeps running
+        # in its worker thread after the await is abandoned.
+        run = asyncio.ensure_future(provider.run(job_id, params))
+        self._cancel_targets[job_id] = run
         try:
-            if self.job_timeout is not None:
-                result = await asyncio.wait_for(
-                    provider.run(job_id, params), timeout=self.job_timeout.total_seconds()
-                )
-            else:
-                result = await provider.run(job_id, params)
+            try:
+                if self.job_timeout is not None:
+                    result = await asyncio.wait_for(
+                        run, timeout=self.job_timeout.total_seconds()
+                    )
+                else:
+                    result = await run
+            finally:
+                self._cancel_targets.pop(job_id, None)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if job_id in self._cancelling and not (current and current.cancelling()):
+                # The provider task was cancelled by cancel(), not this task:
+                # a normal, recorded-elsewhere outcome.
+                return None
+            raise
         except TimeoutError as exc:
+            if job_id in self._cancelling:
+                return None
             if self.job_timeout is None:
                 # No gateway timeout is armed, so this TimeoutError came
                 # from the provider itself (a socket or upstream timeout):
@@ -442,12 +530,18 @@ class JobManager:
         except Exception as exc:  # noqa: BLE001 - deliberately broad: any
             # provider failure becomes a reported error, never an unhandled
             # exception that would silently kill the background task.
+            if job_id in self._cancelling:
+                return None
             return await self.store.update_status(
                 job_id,
                 status=JobStatus.ERROR,
                 error=str(exc),
                 result_expires_at=clock.now() + self.result_ttl,
             )
+        if job_id in self._cancelling:
+            # The provider ignored the cancellation and finished anyway;
+            # cancel() has recorded (or is recording) the job as cancelled.
+            return None
         return await self.store.update_status(
             job_id,
             status=JobStatus.READY,
@@ -609,3 +703,84 @@ class JobManager:
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
         return recovered
+
+    async def cancel(
+        self, job_id: str, *, grace_seconds: float = CANCEL_GRACE_SECONDS
+    ) -> JobRecord:
+        """Stop a pending or processing job and record it as cancelled.
+
+        A job still waiting for a slot never starts. A job whose provider is
+        running has the provider's task cancelled (``CancelledError`` is
+        raised inside ``Provider.run()``, so an ``async with`` around an
+        upstream request closes it). The job then reads ``error`` with
+        ``error == CANCELLED_ERROR``, gets a ``result_expires_at`` like any
+        terminal job, and fires its webhook if it has one.
+
+        Waits at most ``grace_seconds`` for the provider to let go. A
+        provider that ignores the cancellation is recorded as cancelled
+        anyway when the grace period ends, and what it returns later is
+        discarded rather than written over the cancellation.
+
+        Cancelling the same job twice returns the cancelled record both
+        times. Raises ``JobNotFoundError`` for an unknown id and
+        ``JobNotCancellableError`` for a job that already finished (ready,
+        error or expired): its outcome is final and its webhook may already
+        be on its way.
+        """
+        in_flight = self._cancelling.get(job_id)
+        if in_flight is not None:
+            return await asyncio.shield(in_flight)
+
+        active = self._active_jobs.get(job_id)
+        if active is None:
+            # Not running in this process. Either it finished, or it is a
+            # pending/processing row nothing drives (a store shared with a
+            # process that died, before the restart sweep reached it).
+            record = await self.store.get(job_id)
+            if record is None:
+                raise JobNotFoundError(job_id)
+            if record.status == JobStatus.ERROR and record.error == CANCELLED_ERROR:
+                return record
+            if record.status not in (JobStatus.PENDING, JobStatus.PROCESSING):
+                raise JobNotCancellableError(job_id, record.status.value)
+            if job_id in self._cancelling:  # a concurrent cancel() got here first
+                return await asyncio.shield(self._cancelling[job_id])
+
+        outcome: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._cancelling[job_id] = outcome
+        try:
+            target = self._cancel_targets.get(job_id)
+            if target is not None:
+                target.cancel()
+            if active is not None and grace_seconds > 0:
+                try:
+                    await asyncio.wait_for(active.wait(), timeout=grace_seconds)
+                except TimeoutError:
+                    logger.warning(
+                        "job %s: provider did not stop within %.1fs of being cancelled; "
+                        "recording it as cancelled and discarding whatever it returns",
+                        job_id,
+                        grace_seconds,
+                    )
+            record = await self.store.update_status(
+                job_id,
+                status=JobStatus.ERROR,
+                error=CANCELLED_ERROR,
+                result_expires_at=clock.now() + self.result_ttl,
+            )
+        except BaseException as exc:
+            # Never leave a second caller waiting on a future nobody resolves.
+            self._cancelling.pop(job_id, None)
+            outcome.set_exception(exc)
+            outcome.exception()  # retrieved: a second caller may never come
+            raise
+        outcome.set_result(record)
+        if job_id not in self._active_jobs:
+            # The run phase is over, so nothing else will look this up. If
+            # it is not over (the grace period ran out), _run drops it.
+            self._cancelling.pop(job_id, None)
+        if record.webhook_url:
+            task = asyncio.create_task(self._deliver_webhook(record))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        return record

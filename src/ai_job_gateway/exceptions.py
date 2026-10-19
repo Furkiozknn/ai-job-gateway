@@ -49,3 +49,21 @@ class JobSubmissionError(Exception):
         self.status_code = status_code
         self.message = message
         super().__init__(f"submission rejected ({status_code}): {message}")
+
+
+class JobNotCancellableError(Exception):
+    """Raised when cancelling a job that already finished.
+
+    ``JobManager.cancel()`` raises it for a ready, error or expired job (the
+    server maps it to HTTP 409), and the client raises it when the server
+    answers 409. A finished job's outcome is final: its webhook may already
+    have been delivered."""
+
+    def __init__(self, job_id: str, status: str, detail: str | None = None) -> None:
+        self.job_id = job_id
+        #: The job's status when the cancel arrived ("ready", "error",
+        #: "expired"), or "finished" when only the server knows which.
+        self.status = status
+        super().__init__(
+            detail or f"job {job_id!r} already finished ({status}) and cannot be cancelled"
+        )
