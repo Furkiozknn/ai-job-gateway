@@ -28,6 +28,12 @@ All notable changes to this project are recorded here. The format follows
   discarded. Also `JobManager.cancel()`, `JobGatewayClient.cancel()`,
   `JobHandle.cancel()`, `JobGatewayClient.handle(job_id)`, the
   `JobNotCancellableError` exception and an `ai-job-gateway cancel` command.
+- `GET /metrics` in the Prometheus text format, with no new dependency.
+  It covers jobs created per capability, queue wait and provider run time
+  histograms (the run time split by `ready` / `error` / `cancelled`),
+  provider calls in flight, webhook outcomes, and jobs by status read from
+  the store. It needs the bearer key when `AJG_API_KEY` is set. In Python
+  it is `GatewayMetrics` and `JobManager(metrics=...)`.
 
 ### Changed
 - An `Idempotency-Key` reused with a different request (capability, params

@@ -42,6 +42,7 @@ from .exceptions import (
 )
 from .exceptions import JobNotCancellableError
 from .manager import JobManager
+from .metrics import GatewayMetrics
 from .models import JobRecord, JobStatus
 from .providers import EchoProvider, MockProvider, Provider, ProviderError
 from .providers_local import LocalMediaProvider, local_media_registry
@@ -61,6 +62,7 @@ __all__ = [
     "JobNotCancellableError",
     "UnknownCapabilityError",
     "JobManager",
+    "GatewayMetrics",
     "JobRecord",
     "JobStatus",
     "EchoProvider",

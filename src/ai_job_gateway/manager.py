@@ -30,6 +30,7 @@ from . import clock
 from .exceptions import IdempotencyKeyReusedError, UnknownCapabilityError
 from .models import TERMINAL_STATUSES, JobRecord, JobStatus
 from .netguard import WebhookDestinationBlocked, guarded_webhook_client
+from .metrics import GatewayMetrics
 from .providers import Provider
 from .store import JobStore
 from .exceptions import JobNotCancellableError, JobNotFoundError
@@ -142,6 +143,7 @@ class JobManager:
         max_concurrent_jobs: Optional[int] = None,
         max_concurrent_webhooks: Optional[int] = DEFAULT_WEBHOOK_CONCURRENCY,
         allow_private_webhooks: bool = False,
+        metrics: Optional[GatewayMetrics] = None,
     ) -> None:
         self.store = store
         self.registry = registry
@@ -201,6 +203,9 @@ class JobManager:
         # only weakly holds tasks created with create_task, so without this a
         # task can be garbage-collected mid-run.
         self._background_tasks: set[asyncio.Task] = set()
+        #: Counters and histograms served at GET /metrics (see metrics.py).
+        #: Always collected: it is a few dict updates per job.
+        self.metrics = metrics if metrics is not None else GatewayMetrics()
 
     async def _webhook_client(self) -> httpx.AsyncClient:
         """The HTTP client webhooks go out through, created once.
@@ -287,6 +292,9 @@ class JobManager:
         provider = self.registry.get(capability)
         if provider is None:
             raise UnknownCapabilityError(capability)
+        # Per submission, so the wrapper's creation time is the submission
+        # time it measures the queue wait from.
+        provider = self.metrics.instrument(capability, provider)
 
         if idempotency_key is None:
             record = self._new_record(capability, provider, params, webhook_url)
@@ -377,6 +385,7 @@ class JobManager:
             updated_at=now,
             webhook_url=webhook_url,
         )
+        self.metrics.jobs_created.inc(capability=capability)
         return record
 
     def _schedule(self, record: JobRecord, provider: Provider, params: dict) -> None:
@@ -633,6 +642,7 @@ class JobManager:
         await self._record_webhook_outcome(record.id, "failed")
 
     async def _record_webhook_outcome(self, job_id: str, outcome: str) -> None:
+        self.metrics.webhooks.inc(outcome=outcome)
         try:
             await self.store.set_webhook_status(job_id, outcome)
         except Exception:  # noqa: BLE001 - bookkeeping about delivery must

@@ -7,6 +7,7 @@
     POST /v1/jobs/{id}/cancel -> the cancelled record (409 if it already finished, 404 if unknown)
     GET  /v1/capabilities   -> {capability: provider_name, ...}
     GET  /health            -> {"status": "ok"} -- liveness probe, no dependency on the store
+    GET  /metrics           -> Prometheus text format (needs the key when AJG_API_KEY is set)
 
 This is the same shape independently converged on by fal.ai/BFL/RunPod's
 worker-comfyui -- submit returns immediately, the caller polls (or gets a
@@ -29,7 +30,10 @@ from typing import Optional, Any
 from urllib.parse import urlsplit
 
 from fastapi import Query, FastAPI, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
+
+from .metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 
 from . import netguard
 from .exceptions import IdempotencyKeyReusedError, UnknownCapabilityError
@@ -432,5 +436,32 @@ def create_app(
         is up and serving requests -- it does not touch the store, so it
         stays meaningful even for a JobStore backend that's degraded."""
         return {"status": "ok"}
+
+    @app.get(
+        "/metrics",
+        response_class=Response,
+        responses={
+            200: {
+                "content": {METRICS_CONTENT_TYPE: {}},
+                "description": "Prometheus text exposition format 0.0.4.",
+            },
+            **_errors(_401=_UNAUTHORIZED),
+        },
+    )
+    async def metrics(request: Request) -> Response:
+        """Prometheus metrics: jobs created, queue wait and provider run
+        time histograms, provider calls in flight, webhook outcomes, and
+        jobs by status. Needs the bearer key when AJG_API_KEY is set, like
+        every /v1 route: it names capabilities and counts traffic. Point a
+        scrape job's ``authorization`` at the same key."""
+        _require_api_key(request)
+        counts = await manager.store.stats()
+        by_status = {s.value: 0 for s in JobStatus}
+        by_status.update(counts["by_status"])
+        body = manager.metrics.render(
+            jobs_by_status=by_status,
+            registered_capabilities=len(manager.registry),
+        )
+        return Response(content=body, media_type=METRICS_CONTENT_TYPE)
 
     return app

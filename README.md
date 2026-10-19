@@ -310,6 +310,37 @@ The interactive schema is at `/docs` (raw: `/openapi.json`). Every error the API
 
 `GET /health` returns `{"status": "ok"}` and touches nothing but the running process — a liveness probe for a load balancer or orchestrator, independent of whatever `JobStore` backend is degraded or not.
 
+#### Prometheus metrics
+
+`GET /metrics` serves the Prometheus text format (0.0.4), so Prometheus, Grafana Alloy, VictoriaMetrics or the OpenTelemetry Collector's `prometheus` receiver can scrape the gateway. It is rendered without a `prometheus_client` dependency and checked against that library's parser. Celery has the same through Flower, and Hatchet and Temporal export the same kind of queue and run-time metrics. `/v1/stats` only answers "how many jobs are in each state right now"; `/metrics` adds rates and latencies.
+
+| Metric | Type | Labels | What it tells you |
+| --- | --- | --- | --- |
+| `ajg_jobs_created_total` | counter | `capability` | Submission rate. An idempotent replay of an existing job is not counted. |
+| `ajg_job_queue_wait_seconds` | histogram | `capability` | Time a job sat `pending` behind `--max-concurrent-jobs` before its provider started. |
+| `ajg_provider_run_seconds` | histogram | `capability`, `outcome` | Provider latency. `outcome` is `ready`, `error` or `cancelled`; `--job-timeout` cancels a run, so timeouts count as `cancelled`. |
+| `ajg_provider_runs_in_flight` | gauge | `capability` | Provider calls running now. |
+| `ajg_webhook_deliveries_total` | counter | `outcome` | `delivered`, or `failed` after every retry (the dead letter). |
+| `ajg_jobs` | gauge | `status` | Jobs in the store by displayed status, read from the store at scrape time. |
+| `ajg_capabilities_registered` | gauge | | Capabilities this process serves. |
+
+```console
+$ curl -s http://127.0.0.1:8000/metrics | grep -E '_total|_count|ajg_jobs\{'
+ajg_jobs_created_total{capability="echo"} 1
+ajg_jobs_created_total{capability="mock-generate"} 1
+ajg_job_queue_wait_seconds_count{capability="echo"} 1
+ajg_job_queue_wait_seconds_count{capability="mock-generate"} 1
+ajg_provider_run_seconds_count{capability="echo",outcome="ready"} 1
+ajg_provider_run_seconds_count{capability="mock-generate",outcome="ready"} 1
+ajg_jobs{status="pending"} 0
+ajg_jobs{status="processing"} 0
+ajg_jobs{status="ready"} 2
+```
+
+<sub>Real output after one `submit echo` and one `submit mock-generate`, filtered.</sub>
+
+Labels are capability names, statuses and outcomes only, so the number of series stays bounded whatever callers send. Counters live in the process and restart from zero with it, which `rate()` and `increase()` already handle. `ajg_jobs` comes from the store, so it stays correct across a restart. When `AJG_API_KEY` is set, `/metrics` needs it like every `/v1` route (it names capabilities and counts traffic); give the scrape job `authorization: {credentials: <key>}`. Useful first alerts: `rate(ajg_webhook_deliveries_total{outcome="failed"}[15m]) > 0`, and a p95 of `ajg_job_queue_wait_seconds` that keeps climbing (the slot cap is too low for the traffic).
+
 ## Using the Python client
 
 ```python
